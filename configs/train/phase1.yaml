@@ -1,0 +1,28 @@
+train:
+  name: "phase1_audio_only"
+  max_steps: 200_000
+  batch_size: 32
+  val_batch_size: 16
+  num_sources: 2
+  grad_clip: 1.0
+
+  optimizer:
+    name: "AdamW"
+    lr: 1e-3
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+    patience: 10000  # early stopping
+
+  loss:
+    si_snr_weight: 1.0
+    crm_weight: 0.0
+    stft_weight: 0.0
+    perceptual_weight: 0.0
+
+  # --- Data ---
+  n_sources: 2
+  disable_visual: true

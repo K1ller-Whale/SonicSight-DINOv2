@@ -1,0 +1,28 @@
+model:
+  name: "dinov2_av_separator"
+  n_sources: 4
+
+  # --- Audio U-Net ---
+  audio:
+    in_channels: 2  # real + imaginary
+    encoder_channels: [2, 32, 64, 128, 256, 512]
+    kernel_size: 3
+    stride: [2, 2]
+    negative_slope: 0.2
+    norm_groups: 8
+
+  # --- DINOv2 Backbone ---
+  visual:
+    backbone: "facebook/dinov2-base"
+    patch_dim: 768
+    proj_dim: 512
+    image_size: 448
+    num_frames: 150  # 6 sec at 25 fps
+
+  # --- Cross-Modal Attention ---
+  fusion:
+    d_model: 512
+    n_heads: 8
+    n_layers: 2
+    ffn_dim: 2048
+    dropout: 0.1

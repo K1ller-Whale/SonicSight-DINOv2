@@ -1,0 +1,28 @@
+train:
+  name: "phase2_attention_warmup"
+  max_steps: 30_000
+  batch_size: 16
+  val_batch_size: 8
+  num_sources: 2
+  grad_clip: 1.0
+
+  optimizer:
+    name: "AdamW"
+    lr: 5e-4
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  loss:
+    si_snr_weight: 1.0
+    crm_weight: 0.0
+    stft_weight: 0.0
+    perceptual_weight: 0.0
+    attention_entropy_weight: 0.1
+
+  # --- Data ---
+  n_sources: 2
+  disable_visual: false

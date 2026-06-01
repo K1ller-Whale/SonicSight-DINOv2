@@ -1,0 +1,21 @@
+data:
+  # --- Audio ---
+  sample_rate: 16000
+  clip_duration: 6  # seconds
+  n_fft: 512
+  hop_length: 160  # 10 ms at 16 kHz
+  win_length: 400  # 25 ms at 16 kHz
+  n_mels: 80
+  f_min: 80
+  f_max: 7600
+
+  # --- Video ---
+  video_fps: 25
+  frame_size: 448
+  patch_size: 14
+
+  # --- Dataset ---
+  train_batch_size: 8
+  val_batch_size: 4
+  num_workers: 4
+  seed: 42

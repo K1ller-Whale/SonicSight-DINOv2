@@ -1,0 +1,38 @@
+train:
+  name: "phase3_end_to_end"
+  max_steps: 100_000
+  batch_size: 8
+  val_batch_size: 4
+  num_sources: 2  # progressive: 2→3 at 20K, 3→4 at 40K
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4
+
+  optimizer:
+    name: "AdamW"
+    lr_fusion: 3e-4
+    lr_audio_enc: 3e-5
+    lr_dinov2: 1e-5
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  loss:
+    alpha_crm: 0.1
+    beta_stft: 0.05
+    gamma_perceptual: 0.1
+    weight_crm: 0.1  # tuned via grid search
+    weight_stft: 0.05
+    weight_perceptual: 0.1
+
+  # --- Progressive difficulty ---
+  n_sources_schedule:
+    - step: 0
+      n: 2
+    - step: 20000
+      n: 3
+    - step: 40000
+      n: 4
+  disable_visual: false
