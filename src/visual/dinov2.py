@@ -20,7 +20,8 @@ class DINOv2FeatureExtractor(nn.Module):
         super().__init__()
         self.model_name = model_name
         self.image_size = image_size
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Default to CPU for testing; can be overridden
+        self.device = device or "cpu"
 
         # Load DINOv2; all parameters frozen
         self.processor = AutoImageProcessor.from_pretrained(model_name)

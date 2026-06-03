@@ -83,3 +83,9 @@ model:
 ## On API Failures
 - If you get a provider error, wait 30 seconds and retry the exact same step
 - Do not restart from scratch, just retry
+
+## On Empty Response Errors
+- "Expecting value: line 1 column 1" means the server returned 
+  an empty response
+- This is NOT a code error — just retry the exact same step
+- Type `continue` and proceed normally

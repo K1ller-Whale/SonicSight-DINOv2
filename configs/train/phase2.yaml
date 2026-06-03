@@ -1,5 +1,6 @@
 train:
   name: "phase2_attention_warmup"
+  phase: "phase2"
   max_steps: 30_000
   batch_size: 16
   val_batch_size: 8

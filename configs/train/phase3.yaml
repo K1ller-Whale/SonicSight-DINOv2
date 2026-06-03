@@ -1,5 +1,6 @@
 train:
   name: "phase3_end_to_end"
+  phase: "phase3"
   max_steps: 100_000
   batch_size: 8
   val_batch_size: 4

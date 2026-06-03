@@ -1,5 +1,6 @@
 train:
   name: "phase1_audio_only"
+  phase: "phase1"
   max_steps: 200_000
   batch_size: 32
   val_batch_size: 16
