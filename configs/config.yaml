@@ -1,3 +1,7 @@
+---
+name: dinov2-av-separator
+description: DINOv2-guided audio-visual source separation with cross-modal attention
+
 defaults:
   - model: default
   - data: default

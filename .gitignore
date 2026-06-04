@@ -1,0 +1,15 @@
+# Evaluation
+*.json
+!data/transcripts.json
+!data/boxes.json
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# Logs
+logs/
+tensorboard/
+
+# Submission files
+submission.csv
