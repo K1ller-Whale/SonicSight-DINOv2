@@ -21,7 +21,7 @@ class DINOv2FeatureExtractor(nn.Module):
         self.model_name = model_name
         self.image_size = image_size
         # Default to CPU for testing; can be overridden
-        self.device = device or "cpu"
+        self.device = torch.device(device or "cpu")
 
         # Load DINOv2; all parameters frozen
         self.processor = AutoImageProcessor.from_pretrained(model_name)

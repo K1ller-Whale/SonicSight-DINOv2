@@ -1,0 +1,53 @@
+# Kaggle training configuration
+# Optimized for T4 GPU (16GB VRAM)
+
+model:
+  n_sources: 4  # Will be overridden by progressive scheduler
+  audio_channels: [2, 32, 64, 128, 256, 512]
+  attention:
+    n_heads: 8
+    n_layers: 2
+    d_model: 512
+    ffn_dim: 2048
+    dropout: 0.1
+  visual:
+    backbone: facebook/dinov2-base
+    patch_dim: 768
+    proj_dim: 512
+
+train:
+  phase: "phase3"  # Start from phase3 for end-to-end fine-tuning
+  max_steps: 60000
+  loss:
+    alpha_crm: 0.1
+    beta_stft: 0.05
+    gamma_perceptual: 0.1
+  amp: true  # Mixed precision for T4
+
+data:
+  index_file: "/kaggle/input/cache/index.json"
+  n_sources: 4
+  batch_size: 8  # T4-friendly
+  val_batch_size: 4
+  num_workers: 2  # Kaggle limit
+  include_visual: true
+
+optimizer:
+  lr_map:
+    phase1: {"all": 1e-3}
+    phase2: {"fusion": 5e-4}
+    phase3:
+      fusion: 3e-4
+      audio_enc: 3e-5
+      dinov2: 1e-5
+  weight_decay: 1e-4
+
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: "16-mixed"
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  log_every_n_steps: 50
+  val_check_interval: 2000
+  checkpoint_callback: true

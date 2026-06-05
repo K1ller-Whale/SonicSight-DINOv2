@@ -15,6 +15,8 @@ from src.data.preprocessing import (
     AudioPreprocessor,
     STFTModule,
     get_temporal_alignment_table,
+    N_VIDEO_FRAMES,
+    CLIP_LENGTH,
 )
 
 
@@ -142,6 +144,12 @@ class MixAndSepareDataset(Dataset):
         # Pad, mix, compute STFT
         source_waves = self._pad_waveforms(source_waves)
         mixture_wave, source_gains = self._mix(source_waves)
+        # STFTModule enforces length=96000; pad/truncate mixture to match
+        if mixture_wave.shape[-1] != CLIP_LENGTH:
+            if mixture_wave.shape[-1] < CLIP_LENGTH:
+                mixture_wave = F.pad(mixture_wave, (0, CLIP_LENGTH - mixture_wave.shape[-1]))
+            else:
+                mixture_wave = mixture_wave[:CLIP_LENGTH]
         mixture_stft = self._stft(mixture_wave)  # [2, F, T]
         target_waveforms = torch.stack(source_waves)  # [N, L]
 
@@ -160,19 +168,26 @@ class MixAndSepareDataset(Dataset):
                     vf = torch.load(vpath, weights_only=False)
                     visual_list.append(vf)
             if visual_list:
-                # Pad to same frame count and average
-                min_frames = min(v.shape[0] for v in visual_list)
-                aligned = [v[:min_frames] for v in visual_list]
+                # Resample to same frame count (N_VIDEO_FRAMES=150) instead of slicing
+                target_frames = N_VIDEO_FRAMES
+                aligned = []
+                for v in visual_list:
+                    # v: [V, 1024, 768] -> interpolate time dimension
+                    v = v.permute(1, 2, 0).unsqueeze(0)  # [1, 1024, 768, V]
+                    v = F.interpolate(v, size=target_frames, mode='linear', align_corners=False)
+                    v = v.squeeze(0).permute(2, 1, 0)  # [V, 1024, 768]
+                    aligned.append(v)
                 stacked = torch.stack(aligned)  # [N, V, 1024, 768]
                 output["video_frames"] = stacked.mean(dim=0)  # [V, 1024, 768]
 
-        # CRM targets
+        # CRM targets - load in same clip_ids order to match mixed sources
         all_crms = []
         for clip_id in clip_ids:
             cpath = self._all_meta[clip_id].get("crm_path")
             if cpath and os.path.exists(cpath):
                 crm = torch.load(cpath, weights_only=False)
-                all_crms.append(crm[:1])  # first source mask
+                # crm shape: [n_src, 2, F, T]; take first source (index 0) per clip
+                all_crms.append(crm[0:1])  # [1, 2, F, T]
         if len(all_crms) == self.n_sources:
             output["target_crm_masks"] = torch.cat(all_crms, dim=0)  # [N, 2, F, T]
 
@@ -257,10 +272,10 @@ class AudioVisualDataset(Dataset):
     def _mix_sources(self, waveforms_chunks: List[torch.Tensor],
                      db_range_spectrogram: Tuple[float, float] = (-5.0, 5.0)
                      ) -> Tuple[torch.Tensor, torch.Tensor]:
-        max_len = max(w.shape[-1] for w in wave_chunks)
+        max_len = max(w.shape[-1] for w in waveforms_chunks)
         pad_fn = F.pad
         padded = []
-        for w in wave_chunks:
+        for w in waveforms_chunks:
             if w.shape[-1] < max_len:
                 w = pad_fn(w, (0, max_len - w.shape[-1]))
             padded.append(w)

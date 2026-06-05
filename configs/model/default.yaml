@@ -1,6 +1,6 @@
 model:
   name: "dinov2_av_separator"
-  n_sources: 4
+  n_sources: 2
 
   # --- Audio U-Net ---
   audio:

@@ -79,8 +79,11 @@ def evaluate_sisnri(args) -> Dict:
             B, N, L = pred_waveforms.shape
 
             # Reconstruct mixture from STFT for SI-SNRi baseline
+            # Use identity mask (1+0j) to recover original mixture waveform
             istft = ISTFTModule().to(device)
-            mixture_wave = istft(mixture_stft, mixture_stft)  # [1, L]
+            identity_mask = torch.ones_like(mixture_stft)
+            identity_mask[:, 1, :, :] = 0  # imaginary part = 0
+            mixture_wave = istft(identity_mask, mixture_stft)  # [1, L]
 
             for b in range(B):
                 mix = mixture_wave[b]

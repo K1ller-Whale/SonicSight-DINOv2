@@ -24,9 +24,6 @@ train:
     alpha_crm: 0.1
     beta_stft: 0.05
     gamma_perceptual: 0.1
-    weight_crm: 0.1  # tuned via grid search
-    weight_stft: 0.05
-    weight_perceptual: 0.1
 
   # --- Progressive difficulty ---
   n_sources_schedule:

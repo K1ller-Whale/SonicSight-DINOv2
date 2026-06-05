@@ -7,14 +7,14 @@ from torch.utils.data import DataLoader
 from typing import Optional
 import pytorch_lightning as pl
 
-from src.data.preprocessing import AudioPreprocessor, VideoPreprocessor, STFTModule
-from src.data.dataset import AudioVisualDataset
+from src.data.dataset import MixAndSepareDataset
 
 
 class AudioVisualDataModule(pl.LightningDataModule):
     """
     Lightning DataModule for AV source separation.
-    Dispenses train / val / test DataLoaders.
+    Dispenses train / val / test DataLoaders using MixAndSepareDataset
+    (on-the-fly mixing with cached cRM and DINOv2 features).
     """
 
     def __init__(self, index_file: str, n_sources: int = 2,
@@ -31,23 +31,19 @@ class AudioVisualDataModule(pl.LightningDataModule):
         self.include_visual = include_visual
         self.seed = seed
 
-        self.audio_preproc = AudioPreprocessor()
-        self.video_preproc = VideoPreprocessor()
-        self.stft = STFTModule()
-
     def setup(self, stage: Optional[str] = None):
         """Create dataset instances."""
         if stage == "fit" or stage is None:
-            self.train_ds = AudioVisualDataset(
+            self.train_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="train", include_visual=self.include_visual,
             )
-            self.val_ds = AudioVisualDataset(
+            self.val_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="val", include_visual=self.include_visual,
             )
         if stage == "test" or stage is None:
-            self.test_ds = AudioVisualDataset(
+            self.test_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="test", include_visual=self.include_visual,
             )
