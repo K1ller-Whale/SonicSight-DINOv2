@@ -10,6 +10,7 @@ SPEC 11.2:
 import torch
 import torch.nn.functional as F
 import torchaudio.transforms as T
+import torchvision.transforms as VT
 from typing import Optional, Tuple, List
 import numpy as np
 import math
@@ -92,6 +93,15 @@ class STFTModule:
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
+        self._spec = T.Spectrogram(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window_fn=torch.hann_window,
+            power=None,
+            center=True,
+            pad_mode='reflect',
+        )
 
     def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
         """
@@ -100,17 +110,9 @@ class STFTModule:
         Returns:
             spec: [2, F, T]  (real + imag in channel dim)
         """
-        spec = torch.stft(
-            waveform,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=torch.hann_window(self.win_length, device=waveform.device),
-            return_complex=True,
-            center=True,
-            pad_mode='reflect',
-        )  # [F, T] complex
-        stacked = torch.stack([spec.real, spec.imag], dim=0)  # [2, F, T]
+        spec = self._spec(waveform)  # [F, T] complex (torch complex64)
+        # Convert complex to real/imag stacked: [2, F, T]
+        stacked = torch.stack([spec.real, spec.imag], dim=0)
         assert stacked.shape == (2, N_FFT_BINS, N_STFT_FRAMES), \
             f"STFT shape mismatch: {stacked.shape} (expected (2, {N_FFT_BINS}, {N_STFT_FRAMES}))"
         return stacked
@@ -161,13 +163,15 @@ class ISTFTModule:
 
 
 class VideoPreprocessor:
-    """Resize to 448×448, ImageNet normalize.  Input is float [0,1]."""
+    """Resize to 448×448 preserving aspect ratio, then center crop. ImageNet normalize. Input is float [0,1]."""
 
     MEAN = _IMAGENET_MEAN
     STD = _IMAGENET_STD
 
     def __init__(self, image_size: int = IMAGE_SIZE):
         self.image_size = image_size
+        self._resize = VT.Resize(image_size, interpolation=VT.InterpolationMode.BICUBIC, antialias=True)
+        self._center_crop = VT.CenterCrop(image_size)
 
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
         """
@@ -176,11 +180,8 @@ class VideoPreprocessor:
         Returns:
             normalized: [N, 3, image_size, image_size]
         """
-        if frames.shape[-2:] != (self.image_size, self.image_size):
-            frames = F.interpolate(
-                frames, size=(self.image_size, self.image_size),
-                mode='bicubic', align_corners=False,
-            )
+        frames = self._resize(frames)
+        frames = self._center_crop(frames)
         frames = (frames - self.MEAN.to(frames.device)) / self.STD.to(frames.device)
         return frames
 

@@ -1,10 +1,11 @@
 """PyTorch Lightning-compatible DataModule.
 
 Provides train / val / test DataLoaders with per-phase configuration.
+Supports curriculum learning: n_sources increases at configured steps.
 """
 import torch
 from torch.utils.data import DataLoader
-from typing import Optional
+from typing import Optional, List, Tuple
 import pytorch_lightning as pl
 
 from src.data.dataset import MixAndSepareDataset
@@ -15,12 +16,14 @@ class AudioVisualDataModule(pl.LightningDataModule):
     Lightning DataModule for AV source separation.
     Dispenses train / val / test DataLoaders using MixAndSepareDataset
     (on-the-fly mixing with cached cRM and DINOv2 features).
+    Supports curriculum: n_sources increases at configured step thresholds.
     """
 
     def __init__(self, index_file: str, n_sources: int = 2,
                  batch_size: int = 32, val_batch_size: int = 16,
                  num_workers: int = 4, include_visual: bool = True,
-                 seed: int = 42):
+                 seed: int = 42,
+                 curriculum_schedule: Optional[List[Tuple[int, int]]] = None):
         super().__init__()
         self.save_hyperparameters()
         self.index_file = index_file
@@ -30,9 +33,36 @@ class AudioVisualDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.include_visual = include_visual
         self.seed = seed
+        # Curriculum: list of (step_threshold, n_sources)
+        self.curriculum_schedule = curriculum_schedule or [
+            (0, 2), (20000, 3), (40000, 4)
+        ]
+        self._current_step = 0
+
+    def update_curriculum(self, step: int) -> bool:
+        """Update n_sources based on current training step.
+        Returns True if n_sources changed."""
+        self._current_step = step
+        new_n_sources = self.curriculum_schedule[0][1]
+        for threshold, n_src in self.curriculum_schedule:
+            if step >= threshold:
+                new_n_sources = n_src
+            else:
+                break
+        if new_n_sources != self.n_sources:
+            self.n_sources = new_n_sources
+            # Recreate datasets with new n_sources
+            if hasattr(self, 'train_ds'):
+                self.setup(stage="fit")
+            return True
+        return False
+
+    def get_current_n_sources(self) -> int:
+        """Return current number of sources based on curriculum."""
+        return self.n_sources
 
     def setup(self, stage: Optional[str] = None):
-        """Create dataset instances."""
+        """Create dataset instances with current n_sources."""
         if stage == "fit" or stage is None:
             self.train_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,

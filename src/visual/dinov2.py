@@ -20,12 +20,10 @@ class DINOv2FeatureExtractor(nn.Module):
         super().__init__()
         self.model_name = model_name
         self.image_size = image_size
-        # Default to CPU for testing; can be overridden
-        self.device = torch.device(device or "cpu")
 
         # Load DINOv2; all parameters frozen
         self.processor = AutoImageProcessor.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name).to(self.device)
+        self.model = AutoModel.from_pretrained(model_name)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -34,7 +32,10 @@ class DINOv2FeatureExtractor(nn.Module):
         self.num_patches_side = image_size // patch_size  # 448 / 14 = 32
         self.embed_dim = self.model.config.hidden_size  # 768
 
-    @torch.no_grad()
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:

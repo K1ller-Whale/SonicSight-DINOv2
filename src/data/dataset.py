@@ -16,6 +16,7 @@ from src.data.preprocessing import (
     STFTModule,
     get_temporal_alignment_table,
     N_VIDEO_FRAMES,
+    N_STFT_FRAMES,
     CLIP_LENGTH,
 )
 
@@ -159,26 +160,36 @@ class MixAndSepareDataset(Dataset):
             "source_gains": source_gains,
         }
 
-        # Visual features
+        # Visual features - load per source separately (no averaging)
         if self.include_visual:
             visual_list = []
-            for clip_id in clip_ids:
-                vpath = self._all_meta[clip_id].get("visual_path")
-                if vpath and os.path.exists(vpath):
-                    vf = torch.load(vpath, weights_only=False)
-                    visual_list.append(vf)
-            if visual_list:
-                # Resample to same frame count (N_VIDEO_FRAMES=150) instead of slicing
-                target_frames = N_VIDEO_FRAMES
+            for src_idx, clip_id in enumerate(clip_ids):
+                visual_paths = self._all_meta[clip_id].get("visual_paths", [])
+                if visual_paths and src_idx < len(visual_paths):
+                    vpath = visual_paths[src_idx]
+                    if vpath and os.path.exists(vpath):
+                        vf = torch.load(vpath, weights_only=False)
+                    else:
+                        vf = None
+                else:
+                    vf = None
+                visual_list.append(vf)
+
+            if any(v is not None for v in visual_list):
+                # Temporal alignment: STFT frame t -> video frame floor(t * 150 / 601)
+                # Precompute alignment table once
+                align = [int(t * N_VIDEO_FRAMES / N_STFT_FRAMES) for t in range(N_STFT_FRAMES)]
+
                 aligned = []
                 for v in visual_list:
-                    # v: [V, 1024, 768] -> interpolate time dimension
-                    v = v.permute(1, 2, 0).unsqueeze(0)  # [1, 1024, 768, V]
-                    v = F.interpolate(v, size=target_frames, mode='linear', align_corners=False)
-                    v = v.squeeze(0).permute(2, 1, 0)  # [V, 1024, 768]
-                    aligned.append(v)
-                stacked = torch.stack(aligned)  # [N, V, 1024, 768]
-                output["video_frames"] = stacked.mean(dim=0)  # [V, 1024, 768]
+                    if v is not None:
+                        # v: [V_src, 1024, 768] -> lookup each STFT frame's video frame
+                        v_aligned = v[align]  # [601, 1024, 768]
+                    else:
+                        v_aligned = torch.zeros(N_STFT_FRAMES, 1024, 768)
+                    aligned.append(v_aligned)
+                # Stack as [N_sources, T, 1024, 768] - no averaging!
+                output["video_frames"] = torch.stack(aligned)  # [N, T, 1024, 768]
 
         # CRM targets - load in same clip_ids order to match mixed sources
         all_crms = []

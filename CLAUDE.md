@@ -89,3 +89,16 @@ model:
   an empty response
 - This is NOT a code error — just retry the exact same step
 - Type `continue` and proceed normally
+
+## File Writing — Required Protocol
+
+NEVER use the Write tool or Bash with heredoc syntax.
+For ALL file writes use ONLY this exact pattern:
+
+python3 -c "
+with open('FILENAME', 'w', encoding='utf-8') as f:
+    f.write(r'''CONTENT HERE''')
+print('written')
+"
+
+On any InputValidationError: stop immediately, switch to python3 -c above. Zero retries.

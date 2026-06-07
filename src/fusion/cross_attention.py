@@ -6,6 +6,7 @@ Pre-LayerNorm, n_heads=8, d=512, ffn=2048, GELU, dropout=0.1.
 import torch
 import torch.nn as nn
 from src.fusion.positional_encoding import SinusoidalPositionalEncoding
+from typing import Optional
 
 
 class CrossAttentionBlock(nn.Module):
@@ -34,10 +35,13 @@ class CrossAttentionBlock(nn.Module):
         )
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,
-                value: torch.Tensor, key_padding_mask=None) -> torch.Tensor:
+                value: torch.Tensor, key_padding_mask=None,
+                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Pre-LN
         q = self.pre_norm_query(query)
-        attn_out, _ = self.attn(q, key, value, key_padding_mask=key_padding_mask)
+        attn_out, _ = self.attn(q, key, value,
+                                 key_padding_mask=key_padding_mask,
+                                 attn_mask=attn_mask)
         query = query + self.dropout1(attn_out)
 
         # FFN
@@ -49,10 +53,10 @@ class CrossAttentionBlock(nn.Module):
 
 class CrossModalAttentionModule(nn.Module):
     """
-     stacked cross-attention blocks + sinusoidal positional encodings.
+    2 stacked cross-attention blocks + sinusoidal positional encodings.
 
     Audio query: [B, T_a, D_a] — bottleneck sequence from audio U-Net
-    Visual key/value: [B, N_p, D_v] — projected DINOv2 patch tokens
+    Visual key/value: [B, N_p, D_a] — projected DINOv2 patch tokens
     """
 
     def __init__(self, d_model: int = 512, n_heads: int = 8,
@@ -68,11 +72,13 @@ class CrossModalAttentionModule(nn.Module):
         ])
 
     def forward(self, audio_query: torch.Tensor,
-                visual_keyvalue: torch.Tensor) -> torch.Tensor:
+                visual_keyvalue: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             audio_query: [B, T_a, D_a]
             visual_keyvalue: [B, N_p, D_a]  (projected from 768→512)
+            attn_mask: Optional [B*n_heads, T_q, T_kv] or [T_q, T_kv] mask
         Returns:
             fused: [B, T_a, D_a]
         """
@@ -80,6 +86,7 @@ class CrossModalAttentionModule(nn.Module):
         x = self.pos_enc(audio_query)
 
         for block in self.blocks:
-            x = block(x, visual_keyvalue, visual_keyvalue)
+            x = block(x, visual_keyvalue, visual_keyvalue,
+                      key_padding_mask=None, attn_mask=attn_mask)
 
         return x

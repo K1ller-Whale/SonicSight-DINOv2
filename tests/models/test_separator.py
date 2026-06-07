@@ -2,6 +2,7 @@
 
 SPEC 11.3, 11.4: Forward pass, training step, phase-aware training.
 """
+
 import pytest
 import torch
 from src.models.separator import SeparatorModule
@@ -15,12 +16,24 @@ def cfg():
             "n_sources": 2,
         },
         "train": {
+            "optimizer": {
+                "lr": 1e-3,
+                "lr_fusion": 3e-4,
+                "lr_audio_enc": 3e-5,
+                "lr_dinov2": 1e-5,
+                "weight_decay": 1e-4,
+                "betas": [0.9, 0.999],
+            },
+            "scheduler": {
+                "warmup_steps": 1000,
+            },
+            "max_steps": 100000,
             "loss": {
                 "alpha_crm": 0.1,
                 "beta_stft": 0.05,
                 "gamma_perceptual": 0.1,
-            }
-        }
+            },
+        },
     }
 
 
@@ -125,28 +138,41 @@ class TestSeparatorModuleOptimizers:
     """Test optimizer configuration."""
 
     def test_configure_optimizers_phase1(self, cfg):
-        """Phase 1: single optimizer with all params."""
+        """Phase 1: single optimizer with all params + cosine scheduler."""
         model = SeparatorModule(cfg, phase="phase1")
-        optimizer = model.configure_optimizers()
+        result = model.configure_optimizers()
 
-        # Should be AdamW
+        # Lightning 2.x returns dict with optimizer and lr_scheduler
+        assert isinstance(result, dict)
+        assert "optimizer" in result
+        assert "lr_scheduler" in result
+        optimizer = result["optimizer"]
         assert optimizer.__class__.__name__ == "AdamW"
         # Default LR for phase1
         assert optimizer.param_groups[0]["lr"] == 1e-3
 
     def test_configure_optimizers_phase2(self, cfg):
-        """Phase 2: only cross-attention params trainable."""
+        """Phase 2: only cross-attention params trainable + warmup scheduler."""
         model = SeparatorModule(cfg, phase="phase2")
-        optimizer = model.configure_optimizers()
+        result = model.configure_optimizers()
 
+        assert isinstance(result, dict)
+        assert "optimizer" in result
+        assert "lr_scheduler" in result
+        optimizer = result["optimizer"]
         assert optimizer.__class__.__name__ == "AdamW"
-        assert optimizer.param_groups[0]["lr"] == 5e-4
+        # Uses lr_fusion from config (3e-4), default 5e-4
+        assert optimizer.param_groups[0]["lr"] == 3e-4
 
     def test_configure_optimizers_phase3_differential_lr(self, cfg):
-        """Phase 3: differential learning rates."""
+        """Phase 3: differential learning rates + warmup scheduler."""
         model = SeparatorModule(cfg, phase="phase3")
-        optimizer = model.configure_optimizers()
+        result = model.configure_optimizers()
 
+        assert isinstance(result, dict)
+        assert "optimizer" in result
+        assert "lr_scheduler" in result
+        optimizer = result["optimizer"]
         assert optimizer.__class__.__name__ == "AdamW"
         # Phase 3 has multiple param groups with different LRs
         assert len(optimizer.param_groups) > 1

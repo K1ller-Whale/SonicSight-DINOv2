@@ -9,8 +9,10 @@ Cache structure:
         crm/
             <clip_id>.pt          # float16 [N, 2, F, T]
         visual/
-            <clip_id>.pt          # float16 [V, 1024, 768] (DINOv2 patch tokens)
-        index.json                # {clip_id: {"crm_path", "visual_path", "n_sources", "split"}}
+            <clip_id>_src0.pt     # float16 [V, 1024, 768] per source
+            <clip_id>_src1.pt
+            ...
+        index.json                # {clip_id: {"crm_path", "visual_paths": [...], "n_sources", "split", "identity"}}
 
 Usage:
     python scripts/preprocess_data.py \
@@ -26,6 +28,7 @@ import os
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -190,6 +193,19 @@ def get_source_files(clip_dir: str) -> List[Path]:
     return sorted(set(source_files), key=lambda p: p.name)
 
 
+def extract_identity(clip_name: str) -> str:
+    """Extract identity from clip name.
+
+    For MUSIC: clip name format like "video_id_..." -> video_id
+    For AVSpeech: clip name format like "speaker_id_..." -> speaker_id
+    Falls back to clip_name if no underscore found.
+    """
+    parts = clip_name.split('_')
+    if len(parts) >= 2:
+        return parts[0]
+    return clip_name
+
+
 def process_single_clip(
     clip_dir: str,
     stft_module: STFTModule,
@@ -200,8 +216,8 @@ def process_single_clip(
     """Process a single clip directory.
 
     Returns:
-        dict with "crm" (float16 tensor), "visual" (float16 tensor or None),
-        "n_sources" (int), "source_paths" (list of str), or None if failed.
+        dict with "crm" (float16 tensor), "visual" (float16 tensor [N, V, 1024, 768] or None),
+        "n_sources" (int), "source_paths" (list of str), "identity" (str), or None if failed.
     """
     clip_path = Path(clip_dir)
     clip_name = clip_path.name
@@ -243,6 +259,8 @@ def process_single_clip(
     mixture_wave = sources_stacked.sum(dim=0)  # [L]
     mixture_stft = stft_module(mixture_wave)  # [2, F, T]
 
+    n_sources = len(source_waves)
+
     # Compute cRM targets (float16)
     try:
         crm = compute_crm_targets(source_stfts, mixture_stft)  # [N, 2, F, T]
@@ -253,23 +271,30 @@ def process_single_clip(
 
     # Load and process video
     frames = load_video(clip_dir)
+    visual_features_list = []
     if frames is not None and dinov2_model is not None:
         try:
             visual_features = extract_dinov2_features(
                 frames, dinov2_model, batch_size=dinov2_batch_size, device=device
             )
-            visual_features = visual_features.to(torch.float16)
+            visual_features = visual_features.to(torch.float16)  # [V, 1024, 768]
+            # Duplicate per source (same video for all sources in clip)
+            for _ in range(n_sources):
+                visual_features_list.append(visual_features)
         except Exception as e:
             print(f"    ERROR extracting DINOv2 features for {clip_name}: {e}")
-            visual_features = None
+            visual_features_list = [None] * n_sources
     else:
-        visual_features = None
+        visual_features_list = [None] * n_sources
+
+    identity = extract_identity(clip_name)
 
     return {
         "crm": crm,
-        "visual": visual_features,
-        "n_sources": len(source_waves),
+        "visual_list": visual_features_list,
+        "n_sources": n_sources,
         "source_paths": [str(p) for p in source_files],
+        "identity": identity,
     }
 
 
@@ -283,6 +308,7 @@ def preprocess_dataset(
     seed: int = 42,
     device: str = "cpu",
     dinov2_batch_size: int = 4,
+    dataset_type: str = "music",  # "music" or "avspeech"
 ) -> Dict[str, Any]:
     """Preprocess all clips and save cache.
 
@@ -296,9 +322,10 @@ def preprocess_dataset(
         seed: Random seed
         device: torch device
         dinov2_batch_size: Batch size for DINOv2 feature extraction
+        dataset_type: "music" (split by video_id 80/10/10) or "avspeech" (split by speaker_id 85/7.5/7.5)
 
     Returns:
-        Index dict mapping clip_id to cachedOutput (just metadata)
+        Index dict mapping clip_id to cached metadata
     """
     # Find clip directories
     clip_dirs = find_clip_dirs(input_dir)
@@ -312,24 +339,43 @@ def preprocess_dataset(
     crm_dir.mkdir(parents=True, exist_ok=True)
     visual_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create splits
-    random.seed(seed)
-    shuffled = clip_dirs.copy()
-    random.shuffle(shuffled)
-
-    n = len(shuffled)
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
-
-    split_map = {}
-    for i, clip_dir in enumerate(shuffled):
+    # Extract identities and group clips by identity
+    clip_info = []
+    identity_to_clips = defaultdict(list)
+    for clip_dir in clip_dirs:
         clip_name = Path(clip_dir).name
+        identity = extract_identity(clip_name)
+        clip_info.append((clip_dir, clip_name, identity))
+        identity_to_clips[identity].append((clip_dir, clip_name))
+
+    identities = list(identity_to_clips.keys())
+
+    # Identity-based splits (no identity appears in multiple splits)
+    random.seed(seed)
+    random.shuffle(identities)
+
+    n_identities = len(identities)
+    if dataset_type == "avspeech":
+        train_ratio_i, val_ratio_i, test_ratio_i = 0.85, 0.075, 0.075
+    else:  # music
+        train_ratio_i, val_ratio_i, test_ratio_i = train_ratio, val_ratio, test_ratio
+
+    train_end = int(n_identities * train_ratio_i)
+    val_end = int(n_identities * (train_ratio_i + val_ratio_i))
+
+    identity_split = {}
+    for i, ident in enumerate(identities):
         if i < train_end:
-            split_map[clip_name] = "train"
+            identity_split[ident] = "train"
         elif i < val_end:
-            split_map[clip_name] = "val"
+            identity_split[ident] = "val"
         else:
-            split_map[clip_name] = "test"
+            identity_split[ident] = "test"
+
+    # Build split_map for clips
+    split_map = {}
+    for clip_dir, clip_name, identity in clip_info:
+        split_map[clip_name] = identity_split[identity]
 
     # Initialize modules
     stft_module = STFTModule()
@@ -355,20 +401,24 @@ def preprocess_dataset(
         crm_path = crm_dir / f"{clip_name}.pt"
         torch.save(result["crm"], str(crm_path))
 
-        # Save visual features
-        if result["visual"] is not None:
-            visual_path = visual_dir / f"{clip_name}.pt"
-            torch.save(result["visual"], str(visual_path))
-        else:
-            visual_path = None
+        # Save visual features per source
+        visual_paths = []
+        for src_idx, vf in enumerate(result["visual_list"]):
+            if vf is not None:
+                visual_path = visual_dir / f"{clip_name}_src{src_idx}.pt"
+                torch.save(vf, str(visual_path))
+                visual_paths.append(str(visual_path))
+            else:
+                visual_paths.append(None)
 
         # Build index entry
         index[clip_name] = {
             "crm_path": str(crm_path),
-            "visual_path": str(visual_path) if visual_path is not None else None,
+            "visual_paths": visual_paths,
             "n_sources": result["n_sources"],
             "source_paths": result.get("source_paths", []),
             "split": split_map.get(clip_name, "train"),
+            "identity": result["identity"],
         }
 
     # Save index
@@ -381,6 +431,7 @@ def preprocess_dataset(
     print(f"  Train: {sum(1 for v in index.values() if v['split'] == 'train')}")
     print(f"  Val:   {sum(1 for v in index.values() if v['split'] == 'val')}")
     print(f"  Test:  {sum(1 for v in index.values() if v['split'] == 'test')}")
+    print(f"  Identities: {len(identities)} (train: {sum(1 for v in identity_split.values() if v == 'train')}, val: {sum(1 for v in identity_split.values() if v == 'val')}, test: {sum(1 for v in identity_split.values() if v == 'test')})")
 
     return index
 
@@ -391,12 +442,13 @@ def main():
     )
     parser.add_argument("--input_dir", type=str, required=True, help="Input directory containing clip subdirectories")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for cache")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="Training split ratio")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio")
-    parser.add_argument("--test_ratio", type=float, default=0.1, help="Test split ratio")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="Training split ratio (for MUSIC)")
+    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation split ratio (for MUSIC)")
+    parser.add_argument("--test_ratio", type=float, default=0.1, help="Test split ratio (for MUSIC)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="cpu", help="Device for DINOv2")
     parser.add_argument("--dinov2_batch_size", type=int, default=4, help="Batch size for DINOv2 feature extraction")
+    parser.add_argument("--dataset_type", type=str, default="music", choices=["music", "avspeech"], help="Dataset type for identity-based splits")
 
     args = parser.parse_args()
 
@@ -409,6 +461,7 @@ def main():
         seed=args.seed,
         device=args.device,
         dinov2_batch_size=args.dinov2_batch_size,
+        dataset_type=args.dataset_type,
     )
 
 

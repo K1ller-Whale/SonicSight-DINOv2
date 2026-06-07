@@ -26,6 +26,17 @@ from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
 
 
+class CurriculumCallback(pl.Callback):
+    """Callback to update DataModule curriculum based on global step."""
+
+    def __init__(self, datamodule: AudioVisualDataModule):
+        super().__init__()
+        self.datamodule = datamodule
+
+    def on_train_batch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch, batch_idx: int):
+        self.datamodule.update_curriculum(trainer.global_step)
+
+
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     print("=" * 60)
@@ -64,28 +75,51 @@ def main(cfg: DictConfig) -> None:
     print(f"Trainable parameters: {trainable_params:,}")
 
     # ------------------------------------------------------------------ #
+    # DataModule (created early to pass to CurriculumCallback)
+    # ------------------------------------------------------------------ #
+    include_visual = not cfg.train.get("disable_visual", False)
+    n_sources = cfg.model.get("n_sources", cfg.train.get("num_sources", 2))
+
+    # Build curriculum schedule from config
+    curriculum_schedule = []
+    for item in cfg.train.get("n_sources_schedule", []):
+        curriculum_schedule.append((item.step, item.n))
+
+    datamodule = AudioVisualDataModule(
+        index_file=index_file,
+        n_sources=n_sources,
+        batch_size=cfg.train.get("batch_size", cfg.data.get("train_batch_size", 8)),
+        val_batch_size=cfg.train.get("val_batch_size", cfg.data.get("val_batch_size", 4)),
+        num_workers=cfg.data.get("num_workers", 4),
+        include_visual=include_visual,
+        seed=cfg.data.get("seed", 42),
+        curriculum_schedule=curriculum_schedule if curriculum_schedule else None,
+    )
+
+    # ------------------------------------------------------------------ #
     # Callbacks
     # ------------------------------------------------------------------ #
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         ModelCheckpoint(
             dirpath="checkpoints",
-            filename=f"{{step}}-{phase}-" + "{val/si_snr_loss:.2f}",
+            filename=f"{{step}}-{phase}-" + "{val/sisnri:.2f}",
             save_top_k=3,
-            monitor="val/si_snr_loss",
-            mode="min",
+            monitor="val/sisnri",
+            mode="max",
             every_n_train_steps=cfg.train.get("checkpoint_every_n_steps", 5000),
             save_last=True,
         ),
+        CurriculumCallback(datamodule),
     ]
 
     # Early stopping
     if cfg.train.get("patience", 0) > 0:
         callbacks.append(
             EarlyStopping(
-                monitor="val/si_snr_loss",
+                monitor="val/sisnri",
                 patience=cfg.train.patience,
-                mode="min",
+                mode="max",
             )
         )
 
@@ -124,22 +158,6 @@ def main(cfg: DictConfig) -> None:
         trainer_args["resume_from_checkpoint"] = resume_ckpt
 
     trainer = pl.Trainer(**trainer_args)
-
-    # ------------------------------------------------------------------ #
-    # DataModule
-    # ------------------------------------------------------------------ #
-    include_visual = not cfg.train.get("disable_visual", False)
-    n_sources = cfg.model.get("n_sources", cfg.train.get("num_sources", 2))
-
-    datamodule = AudioVisualDataModule(
-        index_file=index_file,
-        n_sources=n_sources,
-        batch_size=cfg.train.get("batch_size", cfg.data.get("train_batch_size", 8)),
-        val_batch_size=cfg.train.get("val_batch_size", cfg.data.get("val_batch_size", 4)),
-        num_workers=cfg.data.get("num_workers", 4),
-        include_visual=include_visual,
-        seed=cfg.data.get("seed", 42),
-    )
 
     # ------------------------------------------------------------------ #
     # Train
