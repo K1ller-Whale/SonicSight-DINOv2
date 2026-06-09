@@ -31,6 +31,7 @@ class SeparatorModule(pl.LightningModule):
         self.phase = phase
         self.save_hyperparameters()
         self.n_sources = cfg.get("model", {}).get("n_sources", 4)
+        max_sources = cfg.get("model", {}).get("n_sources_max", 4)
         self._progressive_steps = [20000, 40000]
         self._progressive_sources = [2, 3, 4]
 
@@ -44,8 +45,8 @@ class SeparatorModule(pl.LightningModule):
         self.bottleneck_proj = nn.Linear(512, 512)
         # Temporal alignment: video frame index mapping (see dataset)
         self.cross_attn = CrossModalAttentionModule()
-        # Source query tokens: N learnable tokens (created on CPU, Lightning moves to device)
-        self.source_queries = nn.Parameter(torch.randn(self.n_sources, 512) * 0.02)
+        # Source query tokens: allocate MAX sources upfront, slice in forward
+        self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
         # iSTFT for waveform reconstruction
         self.istft = ISTFTModule()
 
@@ -108,9 +109,9 @@ class SeparatorModule(pl.LightningModule):
         self._cached_attn_weights = None
 
     def _update_progressive_sources(self) -> bool:
-        """Update n_sources and source_queries based on global_step.
+        """Update n_sources based on global_step.
         Only runs in Phase 3 (progressive curriculum: 2->3->4).
-        Returns True if n_sources changed."""
+        Returns True if n_sources changed. Never replaces source_queries Parameter."""
         if self.phase != "phase3":
             return False
         step = self.global_step
@@ -121,21 +122,18 @@ class SeparatorModule(pl.LightningModule):
             else:
                 break
         if new_n_sources != self.n_sources:
-            old_queries = self.source_queries.data
             self.n_sources = new_n_sources
-            new_queries = torch.randn(new_n_sources, 512, device=old_queries.device) * 0.02
-            min_src = min(old_queries.shape[0], new_n_sources)
-            new_queries[:min_src] = old_queries[:min_src]
-            self.source_queries = nn.Parameter(new_queries)
             return True
         return False
 
     def forward(self, mixture_stft: torch.Tensor,
-                video_frames: Optional[torch.Tensor] = None) -> torch.Tensor:
+                video_frames: Optional[torch.Tensor] = None,
+                visual_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             mixture_stft: [B, 2, F, T] - complex STFT of mixture
-            video_frames: [B, N_frames, 3, H, W] or None (phase1)
+            video_frames: [B, T, 3, H, W] raw RGB frames (deprecated, use visual_features)
+            visual_features: [B, N_sources, T, 1024, 768] or [B, T, 1024, 768] cached DINO features
         Returns:
             separated_waveforms: [B, N_sources, L]
         """
@@ -153,54 +151,85 @@ class SeparatorModule(pl.LightningModule):
         bottleneck_flat = self.bottleneck_proj(bottleneck_flat)  # [B, 171, 512]
 
         # 4. Source query tokens: [N_sources, 512] -> [B, N_sources, 512]
-        source_q = self.source_queries.unsqueeze(0).expand(B, -1, -1)
+        source_q = self.source_queries[:self.n_sources].unsqueeze(0).expand(B, -1, -1)
 
         # Clear cache at start of forward
         self._clear_cache()
 
         # 5. Cross-modal attention
-        if video_frames is not None and self.phase != "phase1":
-            N_v = video_frames.shape[1]
-            video_reshaped = rearrange(video_frames, "B N C H W -> (B N) C H W")
+        have_visual = (visual_features is not None or video_frames is not None) and self.phase != "phase1"
 
-            # Chunk DINOv2 processing to avoid OOM (process in batches of 8 frames)
-            chunk_size = 8
-            num_chunks = (video_reshaped.shape[0] + chunk_size - 1) // chunk_size
-            visual_chunks = []
-            for i in range(num_chunks):
-                start = i * chunk_size
-                end = min((i + 1) * chunk_size, video_reshaped.shape[0])
-                chunk = video_reshaped[start:end]
-                with torch.no_grad():
-                    chunk_features = self.dinov2(chunk)  # [chunk_size, 1024, 768]
-                visual_chunks.append(chunk_features)
-            visual_features = torch.cat(visual_chunks, dim=0)  # [B*N_v, 1024, 768]
+        if have_visual:
+            if visual_features is not None:
+                # CACHED DINO PATH: visual_features shape [B, N_sources, T, 1024, 768] or [B, T, 1024, 768]
+                if visual_features.dim() == 5:
+                    # Per-source features: average across source dim to get [B, T, 1024, 768]
+                    visual_kv = visual_features.mean(dim=1)
+                else:
+                    visual_kv = visual_features  # [B, T, 1024, 768]
 
-            # Reshape: [B, N_v, 1024, 768]
-            visual_features = rearrange(visual_features, "(B N) P D -> B N P D", B=B)
+                # Align to bottleneck timesteps (171 positions)
+                # T=601 STFT frames -> 171 bottleneck frames
+                N_v = visual_kv.shape[1]
+                n_bottleneck = bottleneck_flat.shape[1]
+                align_idx = [int(i * N_v / n_bottleneck) for i in range(n_bottleneck)]
+                visual_kv_aligned = visual_kv[:, align_idx]  # [B, 171, 1024, 768]
 
-            # Temporal alignment: each bottleneck position -> video frame
-            n_bottleneck = bottleneck_flat.shape[1]
-            alignment = torch.floor(
-                torch.arange(n_bottleneck, device=device).float() * N_v / n_bottleneck
-            ).long().clamp(0, N_v - 1)
+                # Project 768 -> 512 (no bias)
+                B_orig, T_bp, P, D_orig = visual_kv_aligned.shape
+                visual_kv_flat = rearrange(visual_kv_aligned, "B T P D -> (B T P) D")
+                visual_kv_proj = self.visual_proj(visual_kv_flat)  # [B*T*P, 512]
+                visual_kv = rearrange(visual_kv_proj, "(B T P) D -> B T P D",
+                                      B=B_orig, T=T_bp)
 
-            # Gather per-position visual features
-            per_pos_visual = []
-            for t_a in range(n_bottleneck):
-                v_idx = alignment[t_a]
-                vf = visual_features[:, v_idx, :, :]  # [B, 1024, 768]
-                per_pos_visual.append(vf)
+            else:
+                # RAW FRAMES PATH: video_frames must be [B, T, 3, H, W]
+                if video_frames.dim() != 5 or video_frames.shape[2] != 3:
+                    raise ValueError(
+                        "video_frames must be raw [B,T,3,H,W]. "
+                        "Use visual_features for cached DINO tokens."
+                    )
+                N_v = video_frames.shape[1]
+                video_reshaped = rearrange(video_frames, "B N C H W -> (B N) C H W")
 
-            # Stack: [B, n_bottleneck, 1024, 768]
-            visual_kv = torch.stack(per_pos_visual, dim=1)
+                # Chunk DINOv2 processing to avoid OOM (process in batches of 8 frames)
+                chunk_size = 8
+                num_chunks = (video_reshaped.shape[0] + chunk_size - 1) // chunk_size
+                visual_chunks = []
+                for i in range(num_chunks):
+                    start = i * chunk_size
+                    end = min((i + 1) * chunk_size, video_reshaped.shape[0])
+                    chunk = video_reshaped[start:end]
+                    with torch.no_grad():
+                        chunk_features = self.dinov2(chunk)  # [chunk_size, 1024, 768]
+                    visual_chunks.append(chunk_features)
+                visual_features_raw = torch.cat(visual_chunks, dim=0)  # [B*N_v, 1024, 768]
 
-            # Project 768 -> 512 (no bias)
-            B_orig, T_bp, P, D_orig = visual_kv.shape
-            visual_kv_flat = rearrange(visual_kv, "B T P D -> (B T P) D")
-            visual_kv_proj = self.visual_proj(visual_kv_flat)  # [B*T*P, 512]
-            visual_kv = rearrange(visual_kv_proj, "(B T P) D -> B T P D",
-                                  B=B_orig, T=T_bp)
+                # Reshape: [B, N_v, 1024, 768]
+                visual_features_raw = rearrange(visual_features_raw, "(B N) P D -> B N P D", B=B)
+
+                # Temporal alignment: each bottleneck position -> video frame
+                n_bottleneck = bottleneck_flat.shape[1]
+                alignment = torch.floor(
+                    torch.arange(n_bottleneck, device=device).float() * N_v / n_bottleneck
+                ).long().clamp(0, N_v - 1)
+
+                # Gather per-position visual features
+                per_pos_visual = []
+                for t_a in range(n_bottleneck):
+                    v_idx = alignment[t_a]
+                    vf = visual_features_raw[:, v_idx, :, :]  # [B, 1024, 768]
+                    per_pos_visual.append(vf)
+
+                # Stack: [B, n_bottleneck, 1024, 768]
+                visual_kv = torch.stack(per_pos_visual, dim=1)
+
+                # Project 768 -> 512 (no bias)
+                B_orig, T_bp, P, D_orig = visual_kv.shape
+                visual_kv_flat = rearrange(visual_kv, "B T P D -> (B T P) D")
+                visual_kv_proj = self.visual_proj(visual_kv_flat)  # [B*T*P, 512]
+                visual_kv = rearrange(visual_kv_proj, "(B T P) D -> B T P D",
+                                      B=B_orig, T=T_bp)
 
             # visual_kv: [B, n_bottleneck, 1024, 512]
             # For cross-attention, flatten visual sequence: [B, n_bottleneck * 1024, 512]

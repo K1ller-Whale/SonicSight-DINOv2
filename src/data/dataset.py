@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from src.data.preprocessing import (
     AudioPreprocessor,
     STFTModule,
+    compute_crm_targets,
     get_temporal_alignment_table,
     N_VIDEO_FRAMES,
     N_STFT_FRAMES,
@@ -108,15 +109,21 @@ class MixAndSepareDataset(Dataset):
     @staticmethod
     def _mix(waves: List[torch.Tensor],
              db_range: Tuple[float, float] = (-5.0, 5.0)
-             ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Mix waveforms with random dB gains."""
+             ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mix waveforms with random dB gains.
+
+        Returns:
+            mixture: [L] sum of scaled sources
+            gains: [N] per-source linear gains
+            scaled_sources: [N, L] scaled source waveforms (for targets)
+        """
         stacked = torch.stack(waves)  # [N, L]
         n = stacked.shape[0]
         db = torch.rand(n) * (db_range[1] - db_range[0]) + db_range[0]
         gains = 10 ** (db / 20.0)
         scaled = stacked * gains.unsqueeze(1)
         mixture = scaled.sum(dim=0)  # [L]
-        return mixture, gains
+        return mixture, gains, scaled
 
     # ------------------------------------------------------------------ #
     # Dataset protocol
@@ -152,7 +159,7 @@ class MixAndSepareDataset(Dataset):
 
         # Pad, mix, compute STFT
         source_waves = self._pad_waveforms(source_waves)
-        mixture_wave, source_gains = self._mix(source_waves)
+        mixture_wave, source_gains, scaled_sources = self._mix(source_waves)
         # STFTModule enforces length=96000; pad/truncate mixture to match
         if mixture_wave.shape[-1] != CLIP_LENGTH:
             if mixture_wave.shape[-1] < CLIP_LENGTH:
@@ -160,12 +167,16 @@ class MixAndSepareDataset(Dataset):
             else:
                 mixture_wave = mixture_wave[:CLIP_LENGTH]
         mixture_stft = self._stft(mixture_wave)  # [2, F, T]
-        target_waveforms = torch.stack(source_waves)  # [N, L]
+
+        # Targets are SCALED sources so they sum to mixture
+        target_waveforms = scaled_sources  # [N, L]
 
         output: Dict[str, Any] = {
             "mixture_stft": mixture_stft,
             "target_waveforms": target_waveforms,
             "source_gains": source_gains,
+            "clip_ids": clip_ids,
+            "clip_id": "+".join(clip_ids),
         }
 
         # Visual features - load per source separately (no averaging)
@@ -197,18 +208,30 @@ class MixAndSepareDataset(Dataset):
                         v_aligned = torch.zeros(N_STFT_FRAMES, 1024, 768)
                     aligned.append(v_aligned)
                 # Stack as [N_sources, T, 1024, 768] - no averaging!
-                output["video_frames"] = torch.stack(aligned)  # [N, T, 1024, 768]
+                output["visual_features"] = torch.stack(aligned)  # [N, T, 1024, 768]
 
-        # CRM targets - load in same clip_ids order to match mixed sources
-        all_crms = []
-        for clip_id in clip_ids:
-            cpath = self._all_meta[clip_id].get("crm_path")
-            if cpath and os.path.exists(cpath):
-                crm = torch.load(cpath, weights_only=False)
-                # crm shape: [n_src, 2, F, T]; take first source (index 0) per clip
-                all_crms.append(crm[0:1])  # [1, 2, F, T]
-        if len(all_crms) == self.n_sources:
-            output["target_crm_masks"] = torch.cat(all_crms, dim=0)  # [N, 2, F, T]
+        # CRM targets
+        if self.split == "train":
+            # Compute cRM on-the-fly from scaled sources (target_waveforms)
+            # scaled_sources shape: [N, L]
+            source_stfts = torch.stack([self._stft(s) for s in scaled_sources])  # [N, 2, F, T]
+            # Add batch dim for compute_crm_targets
+            crm_targets = compute_crm_targets(
+                source_stfts.unsqueeze(0),  # [1, N, 2, F, T]
+                mixture_stft.unsqueeze(0)   # [1, 2, F, T]
+            ).squeeze(0)  # [N, 2, F, T]
+            output["target_crm_masks"] = crm_targets
+        else:
+            # Validation/test: use cached cRM (deterministic)
+            all_crms = []
+            for clip_id in clip_ids:
+                cpath = self._all_meta[clip_id].get("crm_path")
+                if cpath and os.path.exists(cpath):
+                    crm = torch.load(cpath, weights_only=False)
+                    # crm shape: [n_src, 2, F, T]; take first source (index 0) per clip
+                    all_crms.append(crm[0:1])  # [1, 2, F, T]
+            if len(all_crms) == self.n_sources:
+                output["target_crm_masks"] = torch.cat(all_crms, dim=0)  # [N, 2, F, T]
 
         return output
 
