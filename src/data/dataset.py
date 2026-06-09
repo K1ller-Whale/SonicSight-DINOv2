@@ -130,7 +130,15 @@ class MixAndSepareDataset(Dataset):
             raise ValueError(
                 f"Not enough clips ({len(self.clips)}) for n_sources={self.n_sources}"
             )
-        clip_ids = random.sample(self.clips, self.n_sources)
+        if self.split == "train":
+            clip_ids = random.sample(self.clips, self.n_sources)
+        else:
+            # Deterministic: use idx to pick starting clip
+            start = idx % len(self.clips)
+            clip_ids = [
+                self.clips[(start + k) % len(self.clips)]
+                for k in range(self.n_sources)
+            ]
 
         # Load waveforms per source
         source_waves = []

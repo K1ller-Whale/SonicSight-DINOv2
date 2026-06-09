@@ -110,8 +110,9 @@ def main(cfg: DictConfig) -> None:
             every_n_train_steps=cfg.train.get("checkpoint_every_n_steps", 5000),
             save_last=True,
         ),
-        CurriculumCallback(datamodule),
     ]
+    if phase == "phase3":
+        callbacks.append(CurriculumCallback(datamodule))
 
     # Early stopping
     if cfg.train.get("patience", 0) > 0:
@@ -138,6 +139,8 @@ def main(cfg: DictConfig) -> None:
         "max_steps": cfg.train.max_steps,
         "gradient_clip_val": cfg.train.get("grad_clip", 1.0),
         "gradient_clip_algorithm": "norm",
+        "accumulate_grad_batches": cfg.train.get(
+            "gradient_accumulation_steps", 1),
         "callbacks": callbacks,
         "logger": logger,
         "log_every_n_steps": cfg.train.get("log_every_n_steps", 100),
@@ -152,10 +155,8 @@ def main(cfg: DictConfig) -> None:
     if precision:
         trainer_args["precision"] = precision
 
-    # Resume from checkpoint
+    # Resume from checkpoint (passed to trainer.fit, not Trainer constructor)
     resume_ckpt = cfg.train.get("resume_from_checkpoint")
-    if resume_ckpt and os.path.exists(resume_ckpt):
-        trainer_args["resume_from_checkpoint"] = resume_ckpt
 
     trainer = pl.Trainer(**trainer_args)
 
@@ -165,7 +166,11 @@ def main(cfg: DictConfig) -> None:
     print("\n" + "=" * 60)
     print("Starting training...")
     print("=" * 60)
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(
+        model,
+        datamodule=datamodule,
+        ckpt_path=resume_ckpt if resume_ckpt else None
+    )
 
     print("\n" + "=" * 60)
     print("Training complete!")

@@ -34,8 +34,9 @@ class AudioVisualDataModule(pl.LightningDataModule):
         self.include_visual = include_visual
         self.seed = seed
         # Curriculum: list of (step_threshold, n_sources)
+        # Default to no-op schedule: stay at current n_sources
         self.curriculum_schedule = curriculum_schedule or [
-            (0, 2), (20000, 3), (40000, 4)
+            (0, self.n_sources)
         ]
         self._current_step = 0
 
