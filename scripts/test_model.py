@@ -8,12 +8,13 @@ Validates SeparatorModule works correctly without actual data:
 4. Runs forward pass and training_step
 5. Prints parameter counts, output shapes, and loss value
 """
+
 import sys
 import torch
 
-# Add project root to path
-sys.path.insert(0, "D:/development/python/ai/SonicSightDino")
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.models.separator import SeparatorModule
 
 
@@ -88,8 +89,9 @@ def main():
     print(f"    Expected:     [B={B}, N_sources={N_sources}, L={L}]")
 
     # Validate output shape
-    assert output.shape == torch.Size([B, N_sources, L]), \
-        f"Output shape mismatch: {output.shape} vs expected [{B}, {N_sources}, {L}]"
+    assert output.shape == torch.Size(
+        [B, N_sources, L]
+    ), f"Output shape mismatch: {output.shape} vs expected [{B}, {N_sources}, {L}]"
     print("    Output shape: OK")
 
     # 6. Run training_step

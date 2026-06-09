@@ -4,7 +4,7 @@
 
 # --- Core ---
 numpy==1.26.4
-scipy==1.11.0
+scipy>=1.12,<1.14
 tqdm==4.66.4
 
 # --- PyTorch Ecosystem ---

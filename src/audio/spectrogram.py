@@ -20,7 +20,6 @@ class STFTModule(torch.nn.Module):
             hop_length=hop_length,
             win_length=win_length,
             power=None,  # complex output
-            return_complex=True,
         )
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:

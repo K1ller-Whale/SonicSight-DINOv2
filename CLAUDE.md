@@ -102,3 +102,11 @@ print('written')
 "
 
 On any InputValidationError: stop immediately, switch to python3 -c above. Zero retries.
+
+
+## Hallucination Prevention
+- ALWAYS read a file before editing it — never edit from memory
+- NEVER state a line number without reading the file first
+- If unsure what a file contains, read it again
+- After every edit, read back the changed section to verify
+- Never claim a fix is done without running its test
