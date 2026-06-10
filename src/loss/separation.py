@@ -82,33 +82,42 @@ class SISNRLoss(nn.Module):
 
 
 class CRMLoss(nn.Module):
-    """Complex ratio mask (cRM) MSE loss."""
+    """Complex ratio mask (cRM) L1 loss.
+
+    Per Section 7.3 of the report: L1 loss on compressed complex ratio masks
+    is used for robustness on transient frequency-time bins where ideal mask
+    values are genuinely hard to predict. MSE quadratically penalises large
+    errors and destabilises training on these bins.
+    """
 
     def __init__(self):
         super().__init__()
-        self.mse = nn.MSELoss()
+        self.l1 = nn.L1Loss(reduction="mean")
 
     def forward(self, pred_mask: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pred_mask, target_mask: [N, 2, F, T]
+            pred_mask, target_mask: [B, N, 2, F, T]
+        Returns:
+            scalar loss
         """
-        return self.mse(pred_mask, target_mask)
+        return self.l1(pred_mask, target_mask)
 
     def compute_pairwise_losses(self, pred_mask: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
         """
-        Compute pairwise cRM MSE losses for all source pairs.
+        Compute pairwise cRM L1 losses for all source pairs (PIT cost matrix).
         Args:
-            pred_mask: [N, 2, F, T]
-            target_mask: [N, 2, F, T]
+            pred_mask: [B, N, 2, F, T]
+            target_mask: [B, N, 2, F, T]
         Returns:
-            cost_matrix: [N, N] where cost_matrix[i, j] = MSE(pred_mask[i], target_mask[j])
+            cost_matrix: [B, N, N] where cost_matrix[b, i, j] = L1(pred_mask[b,i], target_mask[b,j])
         """
-        N = pred_mask.shape[0]
-        cost_matrix = torch.zeros(N, N, device=pred_mask.device)
-        for i in range(N):
-            for j in range(N):
-                cost_matrix[i, j] = self.mse(pred_mask[i], target_mask[j])
+        B, N = pred_mask.shape[0], pred_mask.shape[1]
+        cost_matrix = torch.zeros(B, N, N, device=pred_mask.device)
+        for b in range(B):
+            for i in range(N):
+                for j in range(N):
+                    cost_matrix[b, i, j] = self.l1(pred_mask[b, i], target_mask[b, j])
         return cost_matrix
 
 
