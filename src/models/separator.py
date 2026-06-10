@@ -459,10 +459,6 @@ class SeparatorModule(pl.LightningModule):
 
         return total_entropy / count if count > 0 else torch.tensor(0.0, device=self.device)
 
-    # def on_before_optimizer_step(self, optimizer):
-    #     """Gradient clipping with max_norm=1.0."""
-    #     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Validation step with metrics."""
         mixture_stft = batch["mixture_stft"]

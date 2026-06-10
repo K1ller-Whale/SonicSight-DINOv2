@@ -16,7 +16,8 @@ train:
   scheduler:
     name: "cosine"
     warmup_steps: 1000
-    patience: 10000  # early stopping
+
+  early_stopping_patience: 10000
 
   loss:
     si_snr_weight: 1.0

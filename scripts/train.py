@@ -115,12 +115,15 @@ def main(cfg: DictConfig) -> None:
         callbacks.append(CurriculumCallback(datamodule))
 
     # Early stopping
-    if cfg.train.get("patience", 0) > 0:
+    early_stop_patience = cfg.train.get("early_stopping_patience", 0)
+    if early_stop_patience > 0:
         callbacks.append(
             EarlyStopping(
                 monitor="val/sisnri",
-                patience=cfg.train.patience,
+                patience=early_stop_patience,
                 mode="max",
+                min_delta=0.01,
+                verbose=True,
             )
         )
 
