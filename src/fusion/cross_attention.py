@@ -36,18 +36,24 @@ class CrossAttentionBlock(nn.Module):
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,
                 value: torch.Tensor, key_padding_mask=None,
-                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attn_mask: Optional[torch.Tensor] = None,
+                need_weights: bool = False,
+                average_attn_weights: bool = False) -> torch.Tensor:
         # Pre-LN
         q = self.pre_norm_query(query)
-        attn_out, _ = self.attn(q, key, value,
+        attn_out, attn_weights = self.attn(q, key, value,
                                  key_padding_mask=key_padding_mask,
-                                 attn_mask=attn_mask)
+                                 attn_mask=attn_mask,
+                                 need_weights=need_weights,
+                                 average_attn_weights=average_attn_weights)
         query = query + self.dropout1(attn_out)
 
         # FFN
         ffn_in = self.pre_norm_ffn(query)
         query = query + self.ffn(ffn_in)
 
+        if need_weights:
+            return query, attn_weights
         return query
 
 
@@ -73,20 +79,36 @@ class CrossModalAttentionModule(nn.Module):
 
     def forward(self, audio_query: torch.Tensor,
                 visual_keyvalue: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attn_mask: Optional[torch.Tensor] = None,
+                need_weights: bool = False,
+                average_attn_weights: bool = False) -> torch.Tensor:
         """
         Args:
             audio_query: [B, T_a, D_a]
             visual_keyvalue: [B, N_p, D_a]  (projected from 768→512)
             attn_mask: Optional [B*n_heads, T_q, T_kv] or [T_q, T_kv] mask
+            need_weights: Whether to return attention weights
+            average_attn_weights: If False, returns per-head weights [B, n_heads, T_q, T_kv]
         Returns:
-            fused: [B, T_a, D_a]
+            fused: [B, T_a, D_a] or (fused, attn_weights) if need_weights=True
         """
         # Add sinusoidal positional encoding to audio query only
         x = self.pos_enc(audio_query)
 
+        attn_weights_list = []
         for block in self.blocks:
-            x = block(x, visual_keyvalue, visual_keyvalue,
-                      key_padding_mask=None, attn_mask=attn_mask)
+            if need_weights:
+                x, attn_w = block(x, visual_keyvalue, visual_keyvalue,
+                                  key_padding_mask=None, attn_mask=attn_mask,
+                                  need_weights=need_weights,
+                                  average_attn_weights=average_attn_weights)
+                attn_weights_list.append(attn_w)
+            else:
+                x = block(x, visual_keyvalue, visual_keyvalue,
+                          key_padding_mask=None, attn_mask=attn_mask,
+                          need_weights=False)
 
+        if need_weights:
+            # Return weights from last block
+            return x, attn_weights_list[-1]
         return x

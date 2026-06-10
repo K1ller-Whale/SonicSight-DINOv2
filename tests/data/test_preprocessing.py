@@ -55,35 +55,37 @@ class TestSTFTModule:
     """Tests for src.data.preprocessing.STFTModule"""
 
     def test_output_shape(self):
-        """SPEC 11.2: STFT → [2, 257, 601]."""
-        from src.data.preprocessing import STFTModule, CLIP_LENGTH
+        """SPEC 11.2: STFT → [B, 2, F, T] with batch dim."""
+        from src.audio.spectrogram import STFTModule
+        from src.data.preprocessing import CLIP_LENGTH
         stft = STFTModule(n_fft=512, hop_length=160)
         waveform = torch.randn(CLIP_LENGTH)  # 16 kHz mono
         spec = stft(waveform)
-        assert spec.shape == (2, 257, 601), f"Got {spec.shape}"
+        assert spec.shape == (1, 2, 257, 601), f"Got {spec.shape}"
 
     def test_inverse_roundtrip(self):
         """iSTFT should output the correct shape and scale."""
-        from src.data.preprocessing import STFTModule, ISTFTModule
+        from src.audio.spectrogram import STFTModule, ISTFTModule
         stft = STFTModule(n_fft=512, hop_length=160)
         istft = ISTFTModule(n_fft=512, hop_length=160)
         waveform = torch.randn(96000)
-        spec = stft(waveform)  # [2, 257, 601]
+        spec = stft(waveform)  # [1, 2, 257, 601]
         # Build a near-identity mask
         mask = torch.ones_like(spec)
+        mask[:, 1, :, :] = 0  # zero imag part for identity
         reconstructed = istft(mask, spec, length=96000)
-        assert reconstructed.shape == waveform.shape
-        # Check amplitude preservation for Gaussian noise (std ≈ 1)
+        assert reconstructed.shape == (1, 96000)
+        # Check amplitude preservation for Gaussian noise
         assert reconstructed.std() > 0.5  # rough sanity check
 
     def test_complex_channels(self):
         """real+imag channels."""
-        from src.data.preprocessing import STFTModule
+        from src.audio.spectrogram import STFTModule
         stft = STFTModule(n_fft=512, hop_length=160)
         waveform = torch.randn(96000)
-        spec = stft(waveform)
-        assert spec[0].dtype == torch.float32
-        assert spec[1].dtype == torch.float32
+        spec = stft(waveform)  # [1, 2, 257, 601]
+        assert spec[0, 0].dtype == torch.float32  # real part
+        assert spec[0, 1].dtype == torch.float32  # imag part
 
 
 class TestVideoPreprocessor:

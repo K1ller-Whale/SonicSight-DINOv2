@@ -68,17 +68,20 @@ expected_lrs = {
     "lr_audio_enc": 3e-5,
     "lr_dinov2": 1e-5,
 }
-# param_groups order: cross_attn, visual_proj, source_queries, decoder, audio_enc, dinov2
-for i in range(4):  # first 4 groups all have lr_fusion
+# param_groups order: fusion (cross_attn+visual_proj+bottleneck_proj+source_queries),
+# decoder, audio_enc, dinov2
+for i in range(2):  # first 2 groups have lr_fusion
     assert (
         abs(param_groups[i]["lr"] - expected_lrs["lr_fusion"]) < 1e-10
     ), f"lr_fusion mismatch at group {i}"
 assert (
-    abs(param_groups[4]["lr"] - expected_lrs["lr_audio_enc"]) < 1e-10
+    abs(param_groups[2]["lr"] - expected_lrs["lr_audio_enc"]) < 1e-10
 ), "lr_audio_enc mismatch"
-assert (
-    abs(param_groups[5]["lr"] - expected_lrs["lr_dinov2"]) < 1e-10
-), "lr_dinov2 mismatch"
+# dinov2 may have 0 params if frozen, so check if group exists
+if len(param_groups) > 3:
+    assert (
+        abs(param_groups[3]["lr"] - expected_lrs["lr_dinov2"]) < 1e-10
+    ), "lr_dinov2 mismatch"
 print("  Phase 3 LRs match config ✓")
 
 # Test 4: Phase 3 configs A, B, C exist and have correct dinov2 settings

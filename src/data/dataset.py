@@ -329,11 +329,21 @@ class AudioVisualDataset(Dataset):
         return mixture, gains
 
 
-class AudioVisualDataModule:
-    """Lightning-style DataModule."""
+import warnings
+
+
+class LegacyAudioVisualDataModule:
+    """Lightning-style DataModule (DEPRECATED).
+
+    Use src.data.datamodule.AudioVisualDataModule instead.
+    """
 
     def __init__(self, index_file: str, train_config: dict,
                  batch_size: int = 8, num_workers: int = 4):
+        warnings.warn(
+            "LegacyAudioVisualDataModule is deprecated. "
+            "Use src.data.datamodule.AudioVisualDataModule instead.",
+            DeprecationWarning, stacklevel=2)
         self.index_file = index_file
         self.batch_size = batch_size
         self.num_workers = num_workers

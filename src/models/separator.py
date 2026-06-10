@@ -48,7 +48,10 @@ class SeparatorModule(pl.LightningModule):
         # Source query tokens: allocate MAX sources upfront, slice in forward
         self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
         # iSTFT for waveform reconstruction
-        self.istft = ISTFTModule()
+        data_cfg = cfg.get("data", {})
+        sr = data_cfg.get("sample_rate", 16000)
+        dur = data_cfg.get("clip_duration", 6)
+        self.istft = ISTFTModule(length=sr * dur)
 
         # Cache for _predict_masks to avoid re-encoding
         self._cached_bottleneck = None
@@ -256,7 +259,7 @@ class SeparatorModule(pl.LightningModule):
             # Register forward hook to capture attention weights (for entropy loss)
             self._cached_attn_weights = []
             def attn_hook(module, input, output):
-                if isinstance(output, tuple) and len(output) == 2:
+                if isinstance(output, tuple) and len(output) == 2 and output[1] is not None:
                     self._cached_attn_weights.append(output[1].detach())
 
             hooks = []
@@ -354,22 +357,30 @@ class SeparatorModule(pl.LightningModule):
 
             si_snr_losses = []
             crm_losses = []
+            perms = []
             for b in range(B):
-                si_snr_loss, crm_loss, _ = self.pit_wrapper(
+                si_snr_loss, crm_loss, perm = self.pit_wrapper(
                     predicted_waveforms[b], target_waveforms[b],
                     pred_masks[b], target_masks[b],
                     alpha_crm=alpha
                 )
                 si_snr_losses.append(si_snr_loss)
                 crm_losses.append(crm_loss)
+                perms.append(perm)
 
             si_snr_loss = torch.stack(si_snr_losses).mean()
             crm_loss = torch.stack(crm_losses).mean()
 
-            # STFT and perceptual losses (no PIT needed - they compare full set)
-            stft_loss = self.stft(predicted_waveforms.view(-1, predicted_waveforms.shape[-1]),
+            # Apply PIT permutation to predictions for STFT and perceptual losses
+            # perms: [B, N] - optimal permutation for each batch element
+            aligned_preds = torch.stack([
+                predicted_waveforms[b, perms[b]] for b in range(B)
+            ])  # [B, N, L]
+
+            # STFT and perceptual losses on PIT-aligned predictions
+            stft_loss = self.stft(aligned_preds.view(-1, aligned_preds.shape[-1]),
                                   target_waveforms.view(-1, target_waveforms.shape[-1]))
-            perceptual_loss = self.perceptual(predicted_waveforms, target_waveforms)
+            perceptual_loss = self.perceptual(aligned_preds, target_waveforms)
 
             total_loss = si_snr_loss + alpha * crm_loss + beta * stft_loss + gamma * perceptual_loss
             self.log("train/si_snr_loss", si_snr_loss, prog_bar=True)
@@ -508,9 +519,23 @@ class SeparatorModule(pl.LightningModule):
 
         elif self.phase == "phase2":
             lr = opt_cfg.get("lr_fusion", 5e-4)
-            trainable_params = list(self.cross_attn.parameters()) + \
-                              list(self.visual_proj.parameters()) + \
-                              [self.source_queries]
+            # Explicitly freeze U-Net (ARCH-06) and enable only intended params
+            for p in self.audio_unet.parameters():
+                p.requires_grad_(False)
+            for p in self.bottleneck_proj.parameters():
+                p.requires_grad_(True)
+            for p in self.cross_attn.parameters():
+                p.requires_grad_(True)
+            for p in self.visual_proj.parameters():
+                p.requires_grad_(True)
+            self.source_queries.requires_grad_(True)
+
+            trainable_params = (
+                list(self.bottleneck_proj.parameters()) +
+                list(self.cross_attn.parameters()) +
+                list(self.visual_proj.parameters()) +
+                [self.source_queries]
+            )
             optimizer = torch.optim.AdamW(
                 trainable_params,
                 lr=lr,
@@ -545,9 +570,10 @@ class SeparatorModule(pl.LightningModule):
             audio_enc_params = [p for p in self.audio_unet.encoder.blocks[-2:].parameters() if p.requires_grad]
 
             param_groups = [
-                {"params": self.cross_attn.parameters(), "lr": lr_fusion},
-                {"params": self.visual_proj.parameters(), "lr": lr_fusion},
-                {"params": [self.source_queries], "lr": lr_fusion},
+                {"params": list(self.cross_attn.parameters()) +
+                        list(self.visual_proj.parameters()) +
+                        list(self.bottleneck_proj.parameters()) +
+                        [self.source_queries], "lr": lr_fusion},
                 {"params": self.audio_unet.decoder.parameters(), "lr": lr_fusion},
                 {"params": audio_enc_params, "lr": lr_audio_enc},
                 {"params": dinov2_params, "lr": lr_dinov2},

@@ -15,6 +15,9 @@ from typing import Optional, Tuple, List
 import numpy as np
 import math
 
+# Canonical STFT/ISTFT modules from src.audio.spectrogram
+from src.audio.spectrogram import STFTModule, ISTFTModule
+
 
 # --- Constants ---
 TARGET_SR = 16000
@@ -83,83 +86,6 @@ class AudioPreprocessor:
             waveform = F.pad(waveform, (0, pad))
 
         return waveform  # [96000]
-
-
-class STFTModule:
-    """Complex STFT → stacked real/imag channels [B, 2, F, T]."""
-
-    def __init__(self, n_fft: int = N_FFT, hop_length: int = HOP_LENGTH,
-                 win_length: int = WIN_LENGTH):
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.win_length = win_length
-        self._spec = T.Spectrogram(
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window_fn=torch.hann_window,
-            power=None,
-            center=True,
-            pad_mode='reflect',
-        )
-
-    def __call__(self, waveform: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            waveform: [L]
-        Returns:
-            spec: [2, F, T]  (real + imag in channel dim)
-        """
-        spec = self._spec(waveform)  # [F, T] complex (torch complex64)
-        # Convert complex to real/imag stacked: [2, F, T]
-        stacked = torch.stack([spec.real, spec.imag], dim=0)
-        assert stacked.shape == (2, N_FFT_BINS, N_STFT_FRAMES), \
-            f"STFT shape mismatch: {stacked.shape} (expected (2, {N_FFT_BINS}, {N_STFT_FRAMES}))"
-        return stacked
-
-    @staticmethod
-    def spectrogram(mag: torch.Tensor) -> torch.Tensor:
-        """Convert complex STFT to magnitude spectrogram."""
-        return mag.pow(2).sum(dim=0).sqrt()
-
-    @staticmethod
-    def phase(mag: torch.Tensor) -> torch.Tensor:
-        """Convert complex STFT to phase."""
-        return torch.atan2(mag[1], mag[0])  # imag, real
-
-
-class ISTFTModule:
-    """Inverse STFT from complex mask and mixture."""
-
-    def __init__(self, n_fft: int = N_FFT, hop_length: int = HOP_LENGTH,
-                 win_length: int = WIN_LENGTH):
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.win_length = win_length
-
-    def __call__(self, mask: torch.Tensor, mixture_stft: torch.Tensor,
-                 length: int = CLIP_LENGTH) -> torch.Tensor:
-        """
-        Args:
-            mask: [2, F, T]  (real + imag mask channels)
-            mixture_stft: [2, F, T]  (real + imag of mixture)
-        Returns:
-            waveform: [L]
-        """
-        # Complex multiplication: M * X where both are complex
-        mask_c = torch.complex(mask[0], mask[1])
-        mix_c = torch.complex(mixture_stft[0], mixture_stft[1])
-        separated = mask_c * mix_c
-
-        waveform = torch.istft(
-            separated,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=torch.hann_window(self.win_length, device=separated.device),
-            length=length,
-        )
-        return waveform
 
 
 class VideoPreprocessor:

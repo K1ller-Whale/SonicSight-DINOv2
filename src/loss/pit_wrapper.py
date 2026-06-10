@@ -4,7 +4,7 @@ SPEC 7.3: PIT for N > 3 using Hungarian algorithm, shared permutation across los
 """
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from scipy.optimize import linear_sum_assignment
 
 
@@ -77,41 +77,60 @@ class PITLossWrapper(nn.Module):
                 alpha_crm: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute PIT-wrapped SI-SNR and cRM losses with shared permutation.
+        Handles both single sample [N, L] and batched [B, N, L] inputs.
         Args:
-            pred_wave: [N, L] predicted waveforms
-            target_wave: [N, L] target waveforms
-            pred_mask: [N, 2, F, T] predicted cRM masks (optional)
-            target_mask: [N, 2, F, T] target cRM masks (optional)
+            pred_wave: [N, L] or [B, N, L] predicted waveforms
+            target_wave: [N, L] or [B, N, L] target waveforms
+            pred_mask: [N, 2, F, T] or [B, N, 2, F, T] predicted cRM masks (optional)
+            target_mask: [N, 2, F, T] or [B, N, 2, F, T] target cRM masks (optional)
             alpha_crm: weight for cRM in combined cost matrix
         Returns:
-            si_snr_loss: scalar SI-SNR loss with optimal permutation
+            si_snr_loss: scalar SI-SNR loss with optimal permutation (mean over batch)
             crm_loss: scalar cRM loss with same permutation (or 0 if masks not provided)
-            perm: [N] the shared permutation used
+            perm: [N] or [B, N] the shared permutation(s) used
         """
-        N = pred_wave.shape[0]
+        # Handle both single sample and batched inputs
+        is_batched = pred_wave.dim() == 3
+        if not is_batched:
+            pred_wave = pred_wave.unsqueeze(0)
+            target_wave = target_wave.unsqueeze(0)
+            if pred_mask is not None:
+                pred_mask = pred_mask.unsqueeze(0)
+                target_mask = target_mask.unsqueeze(0)
 
-        # Compute pairwise costs
-        si_snr_cost = self.si_snr.compute_pairwise_losses(pred_wave, target_wave)
+        B, N, L = pred_wave.shape
+        si_snr_losses = []
+        crm_losses = []
+        perms = []
 
-        if pred_mask is not None and target_mask is not None:
-            crm_cost = self.crm.compute_pairwise_losses(pred_mask, target_mask)
-        else:
-            crm_cost = torch.zeros_like(si_snr_cost)
+        for b in range(B):
+            # Compute pairwise costs for this batch element
+            si_snr_cost = self.si_snr.compute_pairwise_losses(pred_wave[b], target_wave[b])
 
-        # Find shared permutation
-        perm = self.find_shared_permutation(si_snr_cost, crm_cost, alpha=1.0, beta=alpha_crm)
+            if pred_mask is not None and target_mask is not None:
+                crm_cost = self.crm.compute_pairwise_losses(pred_mask[b], target_mask[b])
+            else:
+                crm_cost = torch.zeros_like(si_snr_cost)
 
-        # Apply permutation to compute losses
-        perm_pred_wave = self.apply_permutation(pred_wave, perm)
-        si_snr_loss = -self.si_snr._si_snr(perm_pred_wave[0], target_wave[0])
-        for i in range(1, N):
-            si_snr_loss = si_snr_loss - self.si_snr._si_snr(perm_pred_wave[i], target_wave[i])
-        si_snr_loss = si_snr_loss / N
+            # Find shared permutation
+            perm = self.find_shared_permutation(si_snr_cost, crm_cost, alpha=1.0, beta=alpha_crm)
+            perms.append(perm)
 
-        if pred_mask is not None and target_mask is not None:
-            perm_pred_mask = self.apply_permutation(pred_mask, perm)
-            crm_loss = self.crm(perm_pred_mask, target_mask)
-        else:
-            crm_loss = torch.tensor(0.0, device=pred_wave.device)
+            # Apply permutation to compute losses
+            perm_pred_wave = self.apply_permutation(pred_wave[b], perm)
+            si_snr_loss = -self.si_snr._si_snr(perm_pred_wave[0], target_wave[b, 0])
+            for i in range(1, N):
+                si_snr_loss = si_snr_loss - self.si_snr._si_snr(perm_pred_wave[i], target_wave[b, i])
+            si_snr_loss = si_snr_loss / N
+            si_snr_losses.append(si_snr_loss)
+
+            if pred_mask is not None and target_mask is not None:
+                perm_pred_mask = self.apply_permutation(pred_mask[b], perm)
+                crm_loss = self.crm(perm_pred_mask, target_mask[b])
+                crm_losses.append(crm_loss)
+
+        si_snr_loss = torch.stack(si_snr_losses).mean()
+        crm_loss = torch.stack(crm_losses).mean() if crm_losses else torch.tensor(0.0, device=pred_wave.device)
+        perm = torch.stack(perms)  # [B, N]
 
         return si_snr_loss, crm_loss, perm
