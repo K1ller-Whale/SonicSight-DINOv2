@@ -96,6 +96,31 @@ def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
     return torch.tensor(sisnri_scores)
 
 
+def reconstruct_mixture(mixture_stft: torch.Tensor,
+                        device: torch.device) -> torch.Tensor:
+    """
+    Reconstruct mixture waveform from complex STFT for SI-SNRi
+    baseline. Uses direct torch.istft with no masking.
+
+    Args:
+        mixture_stft: [B, 2, F, T] real+imag channels
+        device: target device
+    Returns:
+        mixture_wave: [B, L]
+    """
+    complex_mix = torch.complex(
+        mixture_stft[:, 0], mixture_stft[:, 1])
+    return torch.istft(
+        complex_mix,
+        n_fft=512,
+        hop_length=160,
+        win_length=400,
+        window=torch.hann_window(400, device=device),
+        length=96000,
+        return_complex=False,
+    )
+
+
 def evaluate_sisnri(args) -> Dict:
     """Evaluate SI-SNRi with PIT on the test split."""
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -119,6 +144,9 @@ def evaluate_sisnri(args) -> Dict:
 
     sisnri_scores = []
 
+    # Move ISTFTModule instantiation outside the batch loop
+    # (No longer needed since we use reconstruct_mixture directly)
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
@@ -135,10 +163,7 @@ def evaluate_sisnri(args) -> Dict:
             B, N, L = pred_waveforms.shape
 
             # Reconstruct mixture from STFT for SI-SNRi baseline
-            istft = ISTFTModule().to(device)
-            identity_mask = torch.ones_like(mixture_stft)
-            identity_mask[:, 1, :, :] = 0  # imaginary part = 0
-            mixture_wave = istft(identity_mask, mixture_stft)  # [1, L]
+            mixture_wave = reconstruct_mixture(mixture_stft, device)
 
             for b in range(B):
                 mix = mixture_wave[b]

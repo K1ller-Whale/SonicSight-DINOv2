@@ -86,6 +86,31 @@ def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
     return sisnri_scores
 
 
+def reconstruct_mixture(mixture_stft: torch.Tensor,
+                        device: torch.device) -> torch.Tensor:
+    """
+    Reconstruct mixture waveform from complex STFT for SI-SNRi
+    baseline. Uses direct torch.istft with no masking.
+
+    Args:
+        mixture_stft: [B, 2, F, T] real+imag channels
+        device: target device
+    Returns:
+        mixture_wave: [B, L]
+    """
+    complex_mix = torch.complex(
+        mixture_stft[:, 0], mixture_stft[:, 1])
+    return torch.istft(
+        complex_mix,
+        n_fft=512,
+        hop_length=160,
+        win_length=400,
+        window=torch.hann_window(400, device=device),
+        length=96000,
+        return_complex=False,
+    )
+
+
 def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
     """Evaluate SI-SNRi on a specific category split."""
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -106,7 +131,6 @@ def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
 
     # Get full test dataloader and filter
     dataloader = dm.test_dataloader()
-    istft = ISTFTModule().to(device)
 
     sisnri_scores = []
     with torch.no_grad():
@@ -126,10 +150,8 @@ def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
 
             B, N, L = pred_waveforms.shape
 
-            # Reconstruct mixture
-            identity_mask = torch.ones_like(mixture_stft)
-            identity_mask[:, 1, :, :] = 0
-            mixture_wave = istft(identity_mask, mixture_stft)
+            # Reconstruct mixture using direct torch.istft
+            mixture_wave = reconstruct_mixture(mixture_stft, device)
 
             for b in range(B):
                 mix = mixture_wave[b]
@@ -147,16 +169,24 @@ def parse_categories(cat_str: str) -> List[str]:
 
 
 def get_clips_by_category(index_file: str, categories: List[str]) -> List[str]:
-    """Load index.json and return clip_ids matching given categories."""
+    """
+    Load index.json and return clip_ids in the test split
+    that belong to any of the given categories.
+
+    index.json format:
+        {clip_id: {"split": "train"|"val"|"test",
+                   "category": str, ...}, ...}
+    """
     with open(index_file) as f:
         index = json.load(f)
 
-    clip_ids = []
-    for entry in index.get("test", []):
-        clip_category = entry.get("category", "")
-        if clip_category in categories:
-            clip_ids.append(entry["clip_id"])
-    return clip_ids
+    categories_set = set(categories)
+    return [
+        clip_id
+        for clip_id, entry in index.items()
+        if entry.get("split") == "test"
+        and entry.get("category") in categories_set
+    ]
 
 
 def evaluate_zero_shot(args) -> Dict:

@@ -40,6 +40,31 @@ def resample_to_16kHz(waveform: torch.Tensor, orig_sr: int) -> torch.Tensor:
     return torchaudio.functional.resample(waveform, orig_sr, 16000)
 
 
+def reconstruct_mixture(mixture_stft: torch.Tensor,
+                        device: torch.device) -> torch.Tensor:
+    """
+    Reconstruct mixture waveform from complex STFT.
+    Uses direct torch.istft with no masking.
+
+    Args:
+        mixture_stft: [B, 2, F, T] real+imag channels
+        device: target device
+    Returns:
+        mixture_wave: [B, L]
+    """
+    complex_mix = torch.complex(
+        mixture_stft[:, 0], mixture_stft[:, 1])
+    return torch.istft(
+        complex_mix,
+        n_fft=512,
+        hop_length=160,
+        win_length=400,
+        window=torch.hann_window(400, device=device),
+        length=96000,
+        return_complex=False,
+    )
+
+
 def evaluate_wer(args) -> Dict:
     """Evaluate WER on separated sources and mixture baseline."""
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -103,12 +128,8 @@ def evaluate_wer(args) -> Dict:
             # separated: [B, N, L]
             B, N, L = separated.shape
 
-            # Also reconstruct mixture waveform for baseline
-            from src.audio.spectrogram import ISTFTModule
-            istft = ISTFTModule().to(device)
-            identity_mask = torch.ones_like(mixture_stft)
-            identity_mask[:, 1, :, :] = 0
-            mixture_wave = istft(identity_mask, mixture_stft)  # [B, L]
+            # Reconstruct mixture waveform for baseline using direct torch.istft
+            mixture_wave = reconstruct_mixture(mixture_stft, device)
 
             for b in range(B):
                 # Baseline: mixture WER
