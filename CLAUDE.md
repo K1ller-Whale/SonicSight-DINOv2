@@ -95,13 +95,13 @@ model:
 NEVER use the Write tool or Bash with heredoc syntax.
 For ALL file writes use ONLY this exact pattern:
 
-python3 -c "
+& C:/Users/H/AppData/Local/Programs/Python/Python312/python.exe -c "
 with open('FILENAME', 'w', encoding='utf-8') as f:
     f.write(r'''CONTENT HERE''')
 print('written')
 "
 
-On any InputValidationError: stop immediately, switch to python3 -c above. Zero retries.
+On any InputValidationError: stop immediately, switch to & C:/Users/H/AppData/Local/Programs/Python/Python312/python.exe-c above. Zero retries.
 
 
 ## Hallucination Prevention

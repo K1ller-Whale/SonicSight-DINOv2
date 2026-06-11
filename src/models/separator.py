@@ -163,39 +163,58 @@ class SeparatorModule(pl.LightningModule):
         have_visual = (visual_features is not None or video_frames is not None) and self.phase != "phase1"
 
         if have_visual:
+            visual_kv = None  # [B, T_a, P, D] aligned visual features for bottleneck cross-attention
+            source_q_local = None  # [B, N, D] source query features (may be per-source or shared)
+
             if visual_features is not None:
-                # CACHED DINO PATH: visual_features shape [B, N_sources, T, 1024, 768] or [B, T, 1024, 768]
+                # CACHED DINO PATH
                 if visual_features.dim() == 5:
-                    # Per-source features: average across source dim to get [B, T, 1024, 768]
-                    visual_kv = visual_features.mean(dim=1)
+                    # Per-source visual features: [B, N_sources, T, 1024, 768]
+                    # Each source query attends EXCLUSIVELY to its visual stream
+                    source_attended = []
+                    for n in range(self.n_sources):
+                        vkv_n = visual_features[:, n]  # [B, T, 1024, 768]
+                        vkv_n = self.visual_proj(vkv_n)  # [B, T, 1024, 512]
+                        vkv_n_flat = rearrange(vkv_n, "B T P D -> B (T P) D")  # [B, T*1024, 512]
+                        sq_n = self.source_queries[n:n+1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, 512]
+                        attended_n = self.cross_attn(sq_n, vkv_n_flat)  # [B, 1, 512]
+                        source_attended.append(attended_n)
+                    source_q_local = torch.cat(source_attended, dim=1)  # [B, N, 512]
+                    # For bottleneck cross-attention: use averaged visual (both sources see aligned context)
+                    N_v = visual_features.shape[2]
+                    n_bottleneck = bottleneck_flat.shape[1]
+                    align_idx = [int(i * N_v / n_bottleneck) for i in range(n_bottleneck)]
+                    visual_avg = visual_features.mean(dim=1)[:, align_idx]  # [B, 171, 1024, 768]
+                    # Project for bottleneck cross-attention
+                    B_v, T_bp, P, _ = visual_avg.shape
+                    visual_flat = rearrange(visual_avg, "B T P D -> (B T P) D")
+                    visual_proj_out = self.visual_proj(visual_flat)
+                    visual_kv = rearrange(visual_proj_out, "(B T P) D -> B T P D", B=B_v, T=T_bp)  # [B, 171, 1024, 512]
                 else:
-                    visual_kv = visual_features  # [B, T, 1024, 768]
-
-                # Align to bottleneck timesteps (171 positions)
-                # T=601 STFT frames -> 171 bottleneck frames
-                N_v = visual_kv.shape[1]
-                n_bottleneck = bottleneck_flat.shape[1]
-                align_idx = [int(i * N_v / n_bottleneck) for i in range(n_bottleneck)]
-                visual_kv_aligned = visual_kv[:, align_idx]  # [B, 171, 1024, 768]
-
-                # Project 768 -> 512 (no bias)
-                B_orig, T_bp, P, D_orig = visual_kv_aligned.shape
-                visual_kv_flat = rearrange(visual_kv_aligned, "B T P D -> (B T P) D")
-                visual_kv_proj = self.visual_proj(visual_kv_flat)  # [B*T*P, 512]
-                visual_kv = rearrange(visual_kv_proj, "(B T P) D -> B T P D",
-                                      B=B_orig, T=T_bp)
-
+                    # 4D shared visual features: [B, T, 1024, 768]
+                    # All source queries attend to shared visual context
+                    visual_kv = self.visual_proj(visual_features)  # [B, T, 1024, 512]
+                    source_q_local = self.source_queries[:self.n_sources].unsqueeze(0).expand(B, -1, -1)  # [B, N, 512]
+                    # Align visual to bottleneck timesteps
+                    N_v = visual_features.shape[1]
+                    n_bottleneck = bottleneck_flat.shape[1]
+                    align_idx = [int(i * N_v / n_bottleneck) for i in range(n_bottleneck)]
+                    visual_aligned = visual_features[:, align_idx]  # [B, 171, 1024, 768]
+                    # Project for bottleneck cross-attention
+                    B_v, T_bp, P, _ = visual_aligned.shape
+                    visual_flat = rearrange(visual_aligned, "B T P D -> (B T P) D")
+                    visual_proj_out = self.visual_proj(visual_flat)
+                    visual_kv = rearrange(visual_proj_out, "(B T P) D -> B T P D", B=B_v, T=T_bp)  # [B, 171, 1024, 512]
             else:
-                # RAW FRAMES PATH: video_frames must be [B, T, 3, H, W]
+                # RAW FRAMES PATH: video_frames must be [B, T_frames, 3, H, W]
                 if video_frames.dim() != 5 or video_frames.shape[2] != 3:
                     raise ValueError(
-                        "video_frames must be raw [B,T,3,H,W]. "
-                        "Use visual_features for cached DINO tokens."
+                        "video_frames must be [B,T,3,H,W]. "
+                        "Pass DINO features as visual_features= instead."
                     )
                 N_v = video_frames.shape[1]
                 video_reshaped = rearrange(video_frames, "B N C H W -> (B N) C H W")
-
-                # Chunk DINOv2 processing to avoid OOM (process in batches of 8 frames)
+                # Process in chunks to avoid OOM
                 chunk_size = 8
                 num_chunks = (video_reshaped.shape[0] + chunk_size - 1) // chunk_size
                 visual_chunks = []
@@ -207,77 +226,54 @@ class SeparatorModule(pl.LightningModule):
                         chunk_features = self.dinov2(chunk)  # [chunk_size, 1024, 768]
                     visual_chunks.append(chunk_features)
                 visual_features_raw = torch.cat(visual_chunks, dim=0)  # [B*N_v, 1024, 768]
-
-                # Reshape: [B, N_v, 1024, 768]
-                visual_features_raw = rearrange(visual_features_raw, "(B N) P D -> B N P D", B=B)
-
-                # Temporal alignment: each bottleneck position -> video frame
+                visual_features_raw = rearrange(visual_features_raw, "(B N) P D -> B N P D", B=B)  # [B, N_v, 1024, 768]
+                # Source queries attend to all visual features (shared context)
+                source_q_local = self.source_queries[:self.n_sources].unsqueeze(0).expand(B, -1, -1)  # [B, N, 512]
+                # Temporal alignment: bottleneck pos -> video frame
                 n_bottleneck = bottleneck_flat.shape[1]
                 alignment = torch.floor(
                     torch.arange(n_bottleneck, device=device).float() * N_v / n_bottleneck
                 ).long().clamp(0, N_v - 1)
-
-                # Gather per-position visual features
                 per_pos_visual = []
                 for t_a in range(n_bottleneck):
-                    v_idx = alignment[t_a]
-                    vf = visual_features_raw[:, v_idx, :, :]  # [B, 1024, 768]
+                    vf = visual_features_raw[:, alignment[t_a], :, :]  # [B, 1024, 768]
                     per_pos_visual.append(vf)
+                visual_kv = torch.stack(per_pos_visual, dim=1)  # [B, n_bottleneck, 1024, 768]
+                # Project for bottleneck cross-attention
+                B_v, T_bp, P, _ = visual_kv.shape
+                visual_flat = rearrange(visual_kv, "B T P D -> (B T P) D")
+                visual_proj_out = self.visual_proj(visual_flat)
+                visual_kv = rearrange(visual_proj_out, "(B T P) D -> B T P D", B=B_v, T=T_bp)  # [B, 171, 1024, 512]
 
-                # Stack: [B, n_bottleneck, 1024, 768]
-                visual_kv = torch.stack(per_pos_visual, dim=1)
-
-                # Project 768 -> 512 (no bias)
-                B_orig, T_bp, P, D_orig = visual_kv.shape
-                visual_kv_flat = rearrange(visual_kv, "B T P D -> (B T P) D")
-                visual_kv_proj = self.visual_proj(visual_kv_flat)  # [B*T*P, 512]
-                visual_kv = rearrange(visual_kv_proj, "(B T P) D -> B T P D",
-                                      B=B_orig, T=T_bp)
-
-            # visual_kv: [B, n_bottleneck, 1024, 512]
-            # For cross-attention, flatten visual sequence: [B, n_bottleneck * 1024, 512]
-            # Create attention mask: each audio query position attends only to its 1024 patches
-            B, T_a, P, D = visual_kv.shape
-            visual_kv_flat = rearrange(visual_kv, "B T P D -> B (T P) D")
-
-            # Build attention mask: [B * n_heads, T_q, T_kv]
-            # T_q = N_sources + T_a (source queries + bottleneck positions)
-            # Each bottleneck position t attends only to its P patches at [t*P : (t+1)*P]
-            # Source queries (first N_sources) attend to all visual patches
-            N_sources = self.n_sources
-            T_q = N_sources + T_a
+            # Cross-attention: combined query (source_q + bottleneck) attends to visual key/value
+            B_ca, T_a, P_vis, D_vis = visual_kv.shape
+            visual_kv_flat = rearrange(visual_kv, "B T P D -> B (T P) D")  # [B, n_bottleneck * 1024, 512]
+            T_q = self.n_sources + T_a
             n_heads = self.cross_attn.blocks[0].attn.num_heads
-            mask = torch.ones(B * n_heads, T_q, T_a * P, dtype=torch.bool, device=device)
+            mask = torch.ones(B * n_heads, T_q, T_a * P_vis, dtype=torch.bool, device=device)
             for t in range(T_a):
-                mask[:, N_sources + t, t * P : (t + 1) * P] = False
-            mask[:, :N_sources, :] = False  # Source queries attend to all
-
-            # Combined query: source queries + bottleneck positions [B, N_sources + T_a, 512]
-            combined_query = torch.cat([source_q, bottleneck_flat], dim=1)
-
-            # Use CrossModalAttentionModule.forward() - handles pos_enc, both blocks, residuals
-            # Register forward hook to capture attention weights (for entropy loss)
+                mask[:, self.n_sources + t, t * P_vis : (t + 1) * P_vis] = False
+            mask[:, :self.n_sources, :] = False  # Source queries attend to all
+            combined_query = torch.cat([source_q_local, bottleneck_flat], dim=1)  # [B, N + 171, 512]
+            # Hook to capture attention weights
             self._cached_attn_weights = []
             def attn_hook(module, input, output):
                 if isinstance(output, tuple) and len(output) == 2 and output[1] is not None:
                     self._cached_attn_weights.append(output[1].detach())
-
             hooks = []
             for block in self.cross_attn.blocks:
                 hooks.append(block.attn.register_forward_hook(attn_hook))
-
             try:
                 attended = self.cross_attn(combined_query, visual_kv_flat, attn_mask=mask)
             finally:
                 for hook in hooks:
                     hook.remove()
-
-            # Extract source features (first N_sources positions from query)
-            source_features = attended[:, :self.n_sources, :]
+            source_features = attended[:, :self.n_sources, :]  # [B, N, 512]
 
         else:
-            # Phase 1: source queries + bottleneck attend to bottleneck (self-attention)
-            combined_query = torch.cat([source_q, bottleneck_flat], dim=1)
+            # Phase 1: no visual, source queries + bottleneck (self-attention)
+            source_q_local = self.source_queries[:self.n_sources].unsqueeze(0).expand(B, -1, -1)
+            combined_query = torch.cat([source_q_local, bottleneck_flat], dim=1)
             attended = self.cross_attn(combined_query, bottleneck_flat)
             source_features = attended[:, :self.n_sources, :]
 
@@ -315,13 +311,18 @@ class SeparatorModule(pl.LightningModule):
         mixture_stft = batch["mixture_stft"]
         target_waveforms = batch["target_waveforms"]
         video_frames = batch.get("video_frames")
+        visual_features = batch.get("visual_features")
         B = target_waveforms.shape[0]
 
-        # Forward pass
+        # Forward pass - route visual input appropriately
         if self.phase == "phase1":
-            predicted_waveforms = self(mixture_stft, video_frames=None)
-        else:
+            predicted_waveforms = self(mixture_stft)
+        elif visual_features is not None:
+            predicted_waveforms = self(mixture_stft, visual_features=visual_features)
+        elif video_frames is not None:
             predicted_waveforms = self(mixture_stft, video_frames=video_frames)
+        else:
+            predicted_waveforms = self(mixture_stft)
 
         # Phase-specific loss
         if self.phase == "phase1":
@@ -463,14 +464,19 @@ class SeparatorModule(pl.LightningModule):
         """Validation step with metrics."""
         mixture_stft = batch["mixture_stft"]
         video_frames = batch.get("video_frames")
+        visual_features = batch.get("visual_features")
         target_waveforms = batch["target_waveforms"]
         B = target_waveforms.shape[0]
 
-        # Forward pass
+        # Forward pass - route visual input appropriately
         if self.phase == "phase1":
-            predicted_waveforms = self(mixture_stft, video_frames=None)
-        else:
+            predicted_waveforms = self(mixture_stft)
+        elif visual_features is not None:
+            predicted_waveforms = self(mixture_stft, visual_features=visual_features)
+        elif video_frames is not None:
             predicted_waveforms = self(mixture_stft, video_frames=video_frames)
+        else:
+            predicted_waveforms = self(mixture_stft)
 
         # Compute SI-SNR loss per batch element with PIT
         losses = []

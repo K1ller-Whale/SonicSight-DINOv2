@@ -142,11 +142,18 @@ def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
             mixture_stft = batch["mixture_stft"].to(device)
             target_waveforms = batch["target_waveforms"].to(device)
 
+            visual_features = batch.get("visual_features")
+            video_frames = batch.get("video_frames")
+
+            # Forward - route visual input appropriately
             if model.phase == "phase1":
-                pred_waveforms = model(mixture_stft, video_frames=None)
+                pred_waveforms = model(mixture_stft)
+            elif visual_features is not None:
+                pred_waveforms = model(mixture_stft, visual_features=visual_features)
+            elif video_frames is not None:
+                pred_waveforms = model(mixture_stft, video_frames=video_frames)
             else:
-                video = batch.get("video_frames")
-                pred_waveforms = model(mixture_stft, video_frames=video)
+                pred_waveforms = model(mixture_stft)
 
             B, N, L = pred_waveforms.shape
 

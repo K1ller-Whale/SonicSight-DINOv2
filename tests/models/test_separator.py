@@ -5,6 +5,7 @@ SPEC 11.3, 11.4: Forward pass, training step, phase-aware training.
 
 import pytest
 import torch
+from einops import rearrange
 from src.models.separator import SeparatorModule
 
 
@@ -211,3 +212,114 @@ class TestSeparatorModuleShapes:
         output = model.audio_unet.decoder(bottleneck, skips, target_shape=x.shape[-2:])
 
         assert output.shape == torch.Size([2, 2, 257, 601])
+
+
+class TestPerSourceAttention:
+    """Tests for per-source visual attention architecture (SPEC FIXME - per-source)."""
+
+    def test_forward_5d_per_source_visual_features(self, cfg):
+        """Per-source 5D visual features [B, N, T, P, D_vis] produce correct output shape."""
+        model = SeparatorModule(cfg, phase="phase2")
+        model.eval()
+        B, N = 2, 2
+        T, P, D_vis = 150, 1024, 768
+        mixture_stft = torch.randn(B, 2, 257, 601)
+
+        visual_features_5d = torch.randn(B, N, T, P, D_vis)
+        with torch.no_grad():
+            out = model(mixture_stft, visual_features=visual_features_5d)
+
+        L_expected = 96000
+        assert out.shape == (B, N, L_expected), \
+            f"5D visual: expected ({B},{N},{L_expected}), got {out.shape}"
+
+    def test_forward_4d_shared_visual_features(self, cfg):
+        """Shared 4D visual features [B, T, P, D_vis] still work."""
+        model = SeparatorModule(cfg, phase="phase2")
+        model.eval()
+        B, N = 2, 2
+        T, P, D_vis = 150, 1024, 768
+        mixture_stft = torch.randn(B, 2, 257, 601)
+
+        visual_features_4d = torch.randn(B, T, P, D_vis)
+        with torch.no_grad():
+            out = model(mixture_stft, visual_features=visual_features_4d)
+
+        L_expected = 96000
+        assert out.shape == (B, N, L_expected), \
+            f"4D visual: expected ({B},{N},{L_expected}), got {out.shape}"
+
+    def test_per_source_differs_from_averaged(self, cfg):
+        """Per-source and averaged visual inputs must produce different outputs."""
+        model = SeparatorModule(cfg, phase="phase2")
+        model.eval()
+        B, N = 1, 2
+        T, P, D_vis = 150, 1024, 768
+        mixture_stft = torch.randn(B, 2, 257, 601)
+
+        # Create visually distinct per-source streams
+        vis_distinct = torch.zeros(B, N, T, P, D_vis)
+        vis_distinct[:, 0] = 1.0   # source 0: all ones
+        vis_distinct[:, 1] = -1.0  # source 1: all minus ones
+        # Averaged version (all sources see same visual)
+        vis_avg = vis_distinct.mean(dim=1, keepdim=True).expand_as(vis_distinct)
+
+        with torch.no_grad():
+            out_per_source = model(mixture_stft, visual_features=vis_distinct)
+            out_averaged = model(mixture_stft, visual_features=vis_avg)
+
+        assert not torch.allclose(out_per_source, out_averaged, atol=1e-4), \
+            "Per-source and averaged outputs are identical — fix not applied"
+        # Also check shapes are correct
+        assert out_per_source.shape == out_averaged.shape == (B, N, 96000)
+
+    def test_video_frames_wrong_shape_raises(self, cfg):
+        """Raw video_frames with wrong channel count raises ValueError."""
+        model = SeparatorModule(cfg, phase="phase2")
+        model.eval()
+        B, T, P = 2, 150, 32
+        H, W = 32, 32
+        mixture_stft = torch.randn(B, 2, 257, 601)
+
+        # Wrong: [B,T,P,C,H,W] instead of [B,T,C,H,W]
+        # C=P=32 is suspicious - this is not channel 3
+        bad_frames = torch.randn(B, T, P, H, W)
+        try:
+            model(mixture_stft, video_frames=bad_frames)
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "video_frames must be [B,T,3,H,W]" in str(e)
+
+    def test_phase1_no_visual_runs(self, cfg):
+        """Phase1 without visual args runs correctly."""
+        model = SeparatorModule(cfg, phase="phase1")
+        model.eval()
+        B, N = 2, 2
+        mixture_stft = torch.randn(B, 2, 257, 601)
+
+        with torch.no_grad():
+            out = model(mixture_stft)
+
+        assert out.shape == (B, N, 96000), \
+            f"Phase1: expected ({B},{N},96000), got {out.shape}"
+
+    def test_n_sources_2_3_4(self, cfg):
+        """Per-source attention works for N=2,3,4 sources."""
+        B, T, P, D = 1, 150, 1024, 768
+        mixture_stft = torch.randn(B, 2, 257, 601)
+
+        for n_src in [2, 3, 4]:
+            cfg_test = {
+                "model": {"n_sources": n_src, "n_sources_max": 4},
+                "train": {
+                    "optimizer": {"lr_fusion": 3e-4, "lr_audio_enc": 3e-5, "lr_dinov2": 1e-5},
+                    "scheduler": {}, "loss": {}
+                },
+            }
+            model = SeparatorModule(cfg_test, phase="phase2")
+            model.eval()
+            visual_features = torch.randn(B, n_src, T, P, D)
+            with torch.no_grad():
+                out = model(mixture_stft, visual_features=visual_features)
+            assert out.shape == (B, n_src, 96000), \
+                f"N={n_src}: expected ({B},{n_src},96000), got {out.shape}"

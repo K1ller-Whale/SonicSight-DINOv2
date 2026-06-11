@@ -93,10 +93,16 @@ class AttentionHook:
 
 
 def extract_attention_weights(model: SeparatorModule, mixture_stft: torch.Tensor,
-                              video_frames: torch.Tensor) -> List[torch.Tensor]:
+                              video_frames: torch.Tensor = None,
+                              visual_features: torch.Tensor = None) -> List[torch.Tensor]:
     """Extract attention weights from cross-attention blocks via forward hooks."""
     with AttentionHook(model) as hook:
-        _ = model(mixture_stft, video_frames=video_frames)
+        if visual_features is not None:
+            _ = model(mixture_stft, visual_features=visual_features)
+        elif video_frames is not None:
+            _ = model(mixture_stft, video_frames=video_frames)
+        else:
+            _ = model(mixture_stft)
     return [w for _, w in sorted(hook.weights, key=lambda x: x[0])]
 
 
@@ -201,17 +207,20 @@ def evaluate_localisation(args) -> Dict:
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
-            video = batch.get("video_frames")  # [1, N_frames, 3, H, W]
+            visual_features = batch.get("visual_features")
+            video_frames = batch.get("video_frames")  # [1, N_frames, 3, H, W]
             clip_id = batch.get("clip_id", [str(batch_idx)])[0] if batch.get("clip_id") else str(batch_idx)
 
-            if video is None:
+            if visual_features is None and video_frames is None:
                 continue
 
-            video = video.to(device)
-            _, _, _, H, W = video.shape
+            if video_frames is not None:
+                video_frames = video_frames.to(device)
+                _, _, _, H, W = video_frames.shape
 
             # Forward with attention hook to extract weights
-            attn_weights_list = extract_attention_weights(model, mixture_stft, video)
+            attn_weights_list = extract_attention_weights(
+                model, mixture_stft, video_frames=video_frames, visual_features=visual_features)
 
             # Use last layer's attention weights for localisation
             if attn_weights_list:

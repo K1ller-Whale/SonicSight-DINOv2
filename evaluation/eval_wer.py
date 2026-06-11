@@ -113,6 +113,8 @@ def evaluate_wer(args) -> Dict:
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
+            visual_features = batch.get("visual_features")
+            video_frames = batch.get("video_frames")
 
             # Get clip_id for transcript lookup
             clip_id = batch.get("clip_id", [str(batch_idx)])[0] if batch.get("clip_id") else str(batch_idx)
@@ -120,10 +122,15 @@ def evaluate_wer(args) -> Dict:
             if not ref:
                 ref = transcripts.get(str(batch_idx), "")
 
+            # Forward - route visual input appropriately
             if model.phase == "phase1":
-                separated = model(mixture_stft, video_frames=None)
+                separated = model(mixture_stft)
+            elif visual_features is not None:
+                separated = model(mixture_stft, visual_features=visual_features)
+            elif video_frames is not None:
+                separated = model(mixture_stft, video_frames=video_frames)
             else:
-                separated = model(mixture_stft, video_frames=batch.get("video_frames"))
+                separated = model(mixture_stft)
 
             # separated: [B, N, L]
             B, N, L = separated.shape
