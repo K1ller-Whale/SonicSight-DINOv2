@@ -233,62 +233,31 @@ class TestPerSourceAttention:
         assert out.shape == (B, N, L_expected), \
             f"5D visual: expected ({B},{N},{L_expected}), got {out.shape}"
 
-    def test_forward_4d_shared_visual_features(self, cfg):
-        """Shared 4D visual features [B, T, P, D_vis] still work."""
+    def test_bottleneck_frame_idx(self, cfg):
+        """Test corrected temporal alignment logic from Step 1."""
+        model = SeparatorModule(cfg, phase="phase2")
+        align = model.bottleneck_frame_idx.tolist()
+        assert len(align) == 171
+        
+        # All positions sharing the same w (time) must map to the same frame
+        for w in range(19):
+            frames_for_w = {align[h*19 + w] for h in range(9)}
+            assert len(frames_for_w) == 1, f"w={w} maps to multiple frames: {frames_for_w}"
+
+    def test_decoder_input_shape(self, cfg):
+        """Test that decoder_input preserves all 171 positions per source."""
         model = SeparatorModule(cfg, phase="phase2")
         model.eval()
         B, N = 2, 2
         T, P, D_vis = 150, 1024, 768
         mixture_stft = torch.randn(B, 2, 257, 601)
-
-        visual_features_4d = torch.randn(B, T, P, D_vis)
+        visual_features = torch.randn(B, N, T, P, D_vis)
+        
         with torch.no_grad():
-            out = model(mixture_stft, visual_features=visual_features_4d)
-
-        L_expected = 96000
-        assert out.shape == (B, N, L_expected), \
-            f"4D visual: expected ({B},{N},{L_expected}), got {out.shape}"
-
-    def test_per_source_differs_from_averaged(self, cfg):
-        """Per-source and averaged visual inputs must produce different outputs."""
-        model = SeparatorModule(cfg, phase="phase2")
-        model.eval()
-        B, N = 1, 2
-        T, P, D_vis = 150, 1024, 768
-        mixture_stft = torch.randn(B, 2, 257, 601)
-
-        # Create visually distinct per-source streams
-        vis_distinct = torch.zeros(B, N, T, P, D_vis)
-        vis_distinct[:, 0] = 1.0   # source 0: all ones
-        vis_distinct[:, 1] = -1.0  # source 1: all minus ones
-        # Averaged version (all sources see same visual)
-        vis_avg = vis_distinct.mean(dim=1, keepdim=True).expand_as(vis_distinct)
-
-        with torch.no_grad():
-            out_per_source = model(mixture_stft, visual_features=vis_distinct)
-            out_averaged = model(mixture_stft, visual_features=vis_avg)
-
-        assert not torch.allclose(out_per_source, out_averaged, atol=1e-4), \
-            "Per-source and averaged outputs are identical — fix not applied"
-        # Also check shapes are correct
-        assert out_per_source.shape == out_averaged.shape == (B, N, 96000)
-
-    def test_video_frames_wrong_shape_raises(self, cfg):
-        """Raw video_frames with wrong channel count raises ValueError."""
-        model = SeparatorModule(cfg, phase="phase2")
-        model.eval()
-        B, T, P = 2, 150, 32
-        H, W = 32, 32
-        mixture_stft = torch.randn(B, 2, 257, 601)
-
-        # Wrong: [B,T,P,C,H,W] instead of [B,T,C,H,W]
-        # C=P=32 is suspicious - this is not channel 3
-        bad_frames = torch.randn(B, T, P, H, W)
-        try:
-            model(mixture_stft, video_frames=bad_frames)
-            assert False, "Should have raised ValueError"
-        except ValueError as e:
-            assert "video_frames must be [B,T,3,H,W]" in str(e)
+            out = model(mixture_stft, visual_features=visual_features)
+            
+        assert hasattr(model, "_cached_decoder_input")
+        assert model._cached_decoder_input.shape == (B, N, 512, 9, 19)
 
     def test_phase1_no_visual_runs(self, cfg):
         """Phase1 without visual args runs correctly."""

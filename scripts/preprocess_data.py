@@ -250,14 +250,14 @@ def process_single_clip(
     # Compute STFT for each source
     source_stfts = []
     for w in padded:
-        stft = stft_module(w)  # [2, F, T]
-        source_stfts.append(stft)
+        stft = stft_module(w)  # [1, 2, F, T] (batch dim from 1D input)
+        source_stfts.append(stft.squeeze(0))  # [2, F, T]
     source_stfts = torch.stack(source_stfts)  # [N, 2, F, T]
 
     # Mix: sum over sources
     sources_stacked = torch.stack(padded)  # [N, L]
     mixture_wave = sources_stacked.sum(dim=0)  # [L]
-    mixture_stft = stft_module(mixture_wave)  # [2, F, T]
+    mixture_stft = stft_module(mixture_wave).squeeze(0)  # [2, F, T]
 
     n_sources = len(source_waves)
 

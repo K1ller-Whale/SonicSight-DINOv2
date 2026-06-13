@@ -87,9 +87,10 @@ class AttentionHook:
         self.hooks = []
 
     def _hook_fn(self, layer_idx: int, output):
-        if isinstance(output, tuple) and len(output) == 2:
-            attn_weights = output[1]  # [B, num_heads, T_q, T_k]
-            self.weights.append((layer_idx, attn_weights.detach().cpu()))
+        if isinstance(output, tuple) and len(output) == 2 and output[1] is not None:
+            attn_weights = output[1].detach().cpu()
+            if attn_weights.shape[-1] == 1024:
+                self.weights.append((layer_idx, attn_weights))
 
 
 def extract_attention_weights(model: SeparatorModule, mixture_stft: torch.Tensor,
@@ -103,36 +104,42 @@ def extract_attention_weights(model: SeparatorModule, mixture_stft: torch.Tensor
             _ = model(mixture_stft, video_frames=video_frames)
         else:
             _ = model(mixture_stft)
-    return [w for _, w in sorted(hook.weights, key=lambda x: x[0])]
+
+    from collections import defaultdict
+    layer_dict = defaultdict(list)
+    for layer_idx, w in hook.weights:
+        layer_dict[layer_idx].append(w)
+
+    results = []
+    B = mixture_stft.shape[0]
+    for layer_idx in sorted(layer_dict.keys()):
+        avg_w = torch.stack(layer_dict[layer_idx]).mean(dim=0)  # [B*171, n_heads, 1, 1024]
+        w_reshaped = avg_w.view(B, 171, avg_w.shape[1], 1024)  # [B, 171, n_heads, 1024]
+        w_avg_heads = w_reshaped.mean(dim=2)  # [B, 171, 1024]
+        results.append(w_avg_heads)
+        
+    return results
 
 
-def attention_to_top50_bbox(attn_weights: torch.Tensor) -> Tuple[float, float, float, float]:
+def attention_to_top50_bbox(attn_map: torch.Tensor, bottleneck_frame_idx: torch.Tensor, target_v: int) -> Tuple[float, float, float, float]:
     """
     Map attention weights to predicted bounding box using top-50 patches.
 
     Args:
-        attn_weights: [num_heads, T_q, T_k] - attention from source queries to visual patches
+        attn_map: [B, 171, 1024]
+        bottleneck_frame_idx: [171] tensor mapping position to frame
+        target_v: target video frame (e.g. 75 for mid-frame)
     Returns:
         (x1, y1, x2, y2) normalized coordinates
     """
-    # Average across heads: [T_q, T_k]
-    attn_map = attn_weights.mean(dim=0)
+    attn = attn_map[0]  # [171, 1024]
+    mask = (bottleneck_frame_idx == target_v)
+    if not mask.any():
+        frame_saliency = attn.mean(dim=0)
+    else:
+        frame_saliency = attn[mask].mean(dim=0)  # [1024]
 
-    # Source queries are first N positions: [N, T_k]
-    n_sources = min(attn_map.shape[0], 4)  # Handle N=2,3,4
-    source_attn = attn_map[:n_sources, :].mean(dim=0)  # [T_k]
-
-    # T_k = T_a * P where P=1024 (32x32 patches per frame)
-    P = 1024
-    T_a = source_attn.shape[0] // P
-
-    # Reshape to [T_a, P] and average across temporal positions
-    source_attn_temporal = source_attn.view(T_a, P).mean(dim=0)  # [P]
-
-    # Get top-50 patches by attention weight
-    top50_indices = source_attn_temporal.topk(min(50, P)).indices.tolist()
-
-    # Create bounding box from top-50 patch indices
+    top50_indices = frame_saliency.topk(min(50, 1024)).indices.tolist()
     return bbox_from_patches(top50_indices)
 
 
@@ -224,8 +231,9 @@ def evaluate_localisation(args) -> Dict:
 
             # Use last layer's attention weights for localisation
             if attn_weights_list:
-                attn_last = attn_weights_list[-1][0]  # [num_heads, T_q, T_k], B=1
-                pred_box = attention_to_top50_bbox(attn_last)
+                attn_last = attn_weights_list[-1]  # [B, 171, 1024]
+                mid_frame_idx = video_frames.shape[1] // 2 if video_frames is not None else 75
+                pred_box = attention_to_top50_bbox(attn_last, model.bottleneck_frame_idx, mid_frame_idx)
             else:
                 pred_box = (0.25, 0.25, 0.75, 0.75)
 
@@ -235,8 +243,8 @@ def evaluate_localisation(args) -> Dict:
                 gt_box_list = gt_boxes[clip_id]
             elif yolo_detector is not None:
                 # Use middle frame for YOLO detection
-                mid_frame_idx = video.shape[1] // 2
-                frame_tensor = video[0, mid_frame_idx].cpu().numpy()  # [3, H, W]
+                mid_frame_idx = video_frames.shape[1] // 2
+                frame_tensor = video_frames[0, mid_frame_idx].cpu().numpy()  # [3, H, W]
                 frame_np = (frame_tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
                 gt_box_list = get_yolo_boxes(yolo_detector, frame_np, args.yolo_conf)
 

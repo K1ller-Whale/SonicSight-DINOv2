@@ -121,6 +121,9 @@ def evaluate_wer(args) -> Dict:
             ref = transcripts.get(clip_id, "")
             if not ref:
                 ref = transcripts.get(str(batch_idx), "")
+            
+            if not ref:
+                continue
 
             # Forward - route visual input appropriately
             if model.phase == "phase1":
@@ -147,7 +150,7 @@ def evaluate_wer(args) -> Dict:
                     mix_hyp = asr.transcribe(mix_wave_16k.numpy())["text"]  # type: ignore
                 else:
                     mix_hyp = ""
-                mix_wer = jiwer.wer(ref, mix_hyp) if (jiwer and ref) else 0.0
+                mix_wer = jiwer.wer(ref, mix_hyp) if jiwer else 0.0
                 mixture_wer_scores.append(mix_wer)
 
                 # Separated sources WER
@@ -159,7 +162,8 @@ def evaluate_wer(args) -> Dict:
                         hyp = asr.transcribe(sep_wave_16k.numpy())["text"]  # type: ignore
                     else:
                         hyp = ""
-                    wer = jiwer.wer(ref, hyp) if (jiwer and ref) else 0.0
+                        
+                    wer = jiwer.wer(ref, hyp) if jiwer else 0.0
                     wer_scores.append(wer)
 
     return {

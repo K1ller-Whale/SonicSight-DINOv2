@@ -166,7 +166,7 @@ class MixAndSepareDataset(Dataset):
                 mixture_wave = F.pad(mixture_wave, (0, CLIP_LENGTH - mixture_wave.shape[-1]))
             else:
                 mixture_wave = mixture_wave[:CLIP_LENGTH]
-        mixture_stft = self._stft(mixture_wave)  # [2, F, T]
+        mixture_stft = self._stft(mixture_wave).squeeze(0)  # [2, F, T]
 
         # Targets are SCALED sources so they sum to mixture
         target_waveforms = scaled_sources  # [N, L]
@@ -214,12 +214,12 @@ class MixAndSepareDataset(Dataset):
         if self.split == "train":
             # Compute cRM on-the-fly from scaled sources (target_waveforms)
             # scaled_sources shape: [N, L]
-            source_stfts = torch.stack([self._stft(s) for s in scaled_sources])  # [N, 2, F, T]
+            source_stfts = torch.stack([self._stft(s).squeeze(0) for s in scaled_sources])  # [N, 2, F, T]
             # Add batch dim for compute_crm_targets
             crm_targets = compute_crm_targets(
-                source_stfts.unsqueeze(0),  # [1, N, 2, F, T]
-                mixture_stft.unsqueeze(0)   # [1, 2, F, T]
-            ).squeeze(0)  # [N, 2, F, T]
+                source_stfts,  # [N, 2, F, T]
+                mixture_stft   # [2, F, T]
+            )  # [N, 2, F, T]
             output["target_crm_masks"] = crm_targets
         else:
             # Validation/test: use cached cRM (deterministic)
