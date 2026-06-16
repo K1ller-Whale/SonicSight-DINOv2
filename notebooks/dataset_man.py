@@ -568,7 +568,7 @@ if __name__ == "__main__":
     # main(audio_only=True, max_clips_per_video=2)
 
     # ── Phase 1 full run ──────────────────────────────────────────────────
-    # main(audio_only=True)
+    main(audio_only=True)
 
     # ── Phase 2/3 smoke test (audio + mp4, 1 clip per video) ─────────────
     # main(audio_only=False, max_clips_per_video=1)
@@ -577,4 +577,4 @@ if __name__ == "__main__":
     # main(audio_only=False)
 
     # Default: Phase 1 audio-only (safe starting point)
-    main(audio_only=True, max_clips_per_video=2)
+    # main(audio_only=True, max_clips_per_video=2)
