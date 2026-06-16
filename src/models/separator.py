@@ -37,7 +37,6 @@ class SeparatorModule(pl.LightningModule):
 
         # --- Components ---
         self.dinov2 = DINOv2FeatureExtractor()
-        self._apply_dinov2_freeze(cfg)
         self.audio_unet = AudioUNet()
         # Visual projection: D_v=768 -> D_a=512, no bias (SPEC 11.3)
         self.visual_proj = nn.Linear(768, 512, bias=False)
@@ -72,6 +71,37 @@ class SeparatorModule(pl.LightningModule):
         self.stft = MultiScaleSTFTLoss()
         self.perceptual = PerceptualLoss(dinov2_extractor=self.dinov2)
         self.pit_wrapper = PITLossWrapper(self.si_snr, self.crm)
+        self._apply_dinov2_freeze(cfg)
+        self._apply_phase_trainability()
+
+    @staticmethod
+    def _set_trainable(module: nn.Module, trainable: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad_(trainable)
+
+    def _apply_phase_trainability(self) -> None:
+        """Enable gradients only for parameters used by the active phase."""
+        if self.phase == "phase1":
+            self._set_trainable(self.audio_unet, True)
+            self._set_trainable(self.bottleneck_proj, False)
+            self._set_trainable(self.visual_proj, False)
+            self._set_trainable(self.cross_attn, False)
+            self.source_queries.requires_grad_(False)
+        elif self.phase == "phase2":
+            self._set_trainable(self.audio_unet, False)
+            self._set_trainable(self.bottleneck_proj, True)
+            self._set_trainable(self.visual_proj, True)
+            self._set_trainable(self.cross_attn, True)
+            self.source_queries.requires_grad_(True)
+        else:
+            self._set_trainable(self.audio_unet, False)
+            self._set_trainable(self.audio_unet.decoder, True)
+            for block in self.audio_unet.encoder.blocks[-2:]:
+                self._set_trainable(block, True)
+            self._set_trainable(self.bottleneck_proj, True)
+            self._set_trainable(self.visual_proj, True)
+            self._set_trainable(self.cross_attn, True)
+            self.source_queries.requires_grad_(True)
 
     def _apply_dinov2_freeze(self, cfg: Dict[str, Any]):
         """Apply DINOv2 freezing based on config (phase3 only)."""
@@ -153,19 +183,19 @@ class SeparatorModule(pl.LightningModule):
         # 1. Audio U-Net encoder -> bottleneck [B, 512, 9, 19]
         bottleneck, skips = self.audio_unet.encoder(mixture_stft)
 
-        # 2. Flatten bottleneck: [B, 512, 9, 19] -> [B, 171, 512]
-        bottleneck_flat = rearrange(bottleneck, "B C H W -> B (H W) C")
-
-        # 3. Bottleneck projection (Conv1x1 equivalent)
-        bottleneck_flat = self.bottleneck_proj(bottleneck_flat)  # [B, 171, 512]
-
         # Clear cache at start of forward
         self._clear_cache()
 
         # 5. Cross-modal attention
         have_visual = (visual_features is not None) and self.phase != "phase1"
+        bottleneck_flat = None
 
         if have_visual:
+            # 2. Flatten bottleneck: [B, 512, 9, 19] -> [B, 171, 512]
+            bottleneck_flat = rearrange(bottleneck, "B C H W -> B (H W) C")
+
+            # 3. Bottleneck projection (Conv1x1 equivalent)
+            bottleneck_flat = self.bottleneck_proj(bottleneck_flat)  # [B, 171, 512]
             decoder_inputs = []
             self._cached_attn_weights = []
 
@@ -406,8 +436,9 @@ class SeparatorModule(pl.LightningModule):
 
         if self.phase == "phase1":
             lr = opt_cfg.get("lr", 1e-3)
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(
-                self.parameters(),
+                trainable_params,
                 lr=lr,
                 weight_decay=opt_cfg.get("weight_decay", 1e-4),
                 betas=opt_cfg.get("betas", [0.9, 0.999])
