@@ -1,3 +1,4 @@
+# @package _global_
 train:
   name: "phase3_config_a"
   phase: "phase3"
@@ -7,6 +8,12 @@ train:
   num_sources: 2  # progressive: 2→3 at 20K, 3→4 at 40K
   grad_clip: 1.0
   gradient_accumulation_steps: 4
+  precision: null
+  log_every_n_steps: 100
+  val_check_interval: 5000
+  num_sanity_val_steps: 2
+  checkpoint_every_n_steps: 5000
+  resume_from_checkpoint: null
 
   optimizer:
     name: "AdamW"

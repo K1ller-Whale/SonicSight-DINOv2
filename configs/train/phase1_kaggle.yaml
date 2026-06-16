@@ -1,3 +1,4 @@
+# @package _global_
 train:
   name: "phase1_audio_only_kaggle"
   phase: "phase1"
@@ -33,11 +34,19 @@ train:
   disable_visual: true
   n_sources: 2
 
-  model:
-    n_sources: 2
+model:
+  n_sources: 2
 
-  data:
-    index_file: "/kaggle/working/cache/index.json"
-    cache_dir: "/kaggle/working/cache"
-    num_workers: 4          # 2 per GPU
-    seed: 42
+data:
+  index_file: "/kaggle/working/cache/index.json"
+  cache_dir: "/kaggle/working/cache"
+  num_workers: 4          # 2 per GPU
+  seed: 42
+
+trainer:
+  accelerator: "auto"
+  devices: "auto"
+
+outputs:
+  checkpoint_dir: "/kaggle/working/checkpoints"
+  log_dir: "/kaggle/working/logs"

@@ -104,10 +104,15 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # Callbacks
     # ------------------------------------------------------------------ #
+    outputs_cfg = cfg.get("outputs", {})
+    logger_cfg = cfg.get("logger", {})
+    checkpoint_dir = outputs_cfg.get("checkpoint_dir", "checkpoints")
+    log_dir = logger_cfg.get("save_dir") or outputs_cfg.get("log_dir", "logs")
+
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         ModelCheckpoint(
-            dirpath="checkpoints",
+            dirpath=checkpoint_dir,
             filename=f"{{step}}-{phase}-" + "{val/sisnri:.2f}",
             save_top_k=3,
             monitor="val/sisnri",
@@ -136,13 +141,14 @@ def main(cfg: DictConfig) -> None:
     # Logger
     # ------------------------------------------------------------------ #
     logger = TensorBoardLogger(
-        save_dir="logs",
+        save_dir=log_dir,
         name=f"{cfg.train.name}_{phase}",
     )
 
     # ------------------------------------------------------------------ #
     # Trainer
     # ------------------------------------------------------------------ #
+    trainer_cfg = cfg.get("trainer", {})
     trainer_args = {
         "max_steps": cfg.train.max_steps,
         "gradient_clip_val": cfg.train.get("grad_clip", 1.0),
@@ -153,20 +159,21 @@ def main(cfg: DictConfig) -> None:
         "log_every_n_steps": cfg.train.get("log_every_n_steps", 100),
         "val_check_interval": cfg.train.get("val_check_interval", 5000),
         "num_sanity_val_steps": cfg.train.get("num_sanity_val_steps", 2),
-        "accelerator": "auto",
-        "devices": 1,
+        "accelerator": trainer_cfg.get("accelerator", "auto"),
+        "devices": trainer_cfg.get("devices", 1),
+        "num_nodes": trainer_cfg.get("num_nodes", 1),
     }
 
-    trainer_args.update(
-        {
-            "strategy": "ddp_find_unused_parameters_false",
-            "devices": 2,
-            "num_nodes": 1,
-        }
-    )
+    strategy = trainer_cfg.get("strategy")
+    if strategy:
+        trainer_args["strategy"] = strategy
+    elif isinstance(trainer_args["devices"], int) and trainer_args["devices"] > 1:
+        trainer_args["strategy"] = "ddp_find_unused_parameters_false"
 
     # Precision
     precision = cfg.train.get("precision")
+    if precision is None:
+        precision = trainer_cfg.get("precision")
     if precision:
         trainer_args["precision"] = precision
 

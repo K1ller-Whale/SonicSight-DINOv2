@@ -3,10 +3,10 @@ name: dinov2-av-separator
 description: DINOv2-guided audio-visual source separation with cross-modal attention
 
 defaults:
+  - _self_
   - model: default
   - data: default
   - train: phase1
-  - _self_
 
 hydra:
   run:
@@ -14,3 +14,17 @@ hydra:
   sweep:
     dir: logs/multirun/${now:%Y-%m-%d}
     subdir: ${hydra:job.num}
+
+trainer:
+  accelerator: "auto"
+  devices: 1
+  num_nodes: 1
+  precision: null
+  strategy: null
+
+outputs:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+
+logger:
+  save_dir: null
