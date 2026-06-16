@@ -1,0 +1,43 @@
+train:
+  name: "phase1_audio_only_kaggle"
+  phase: "phase1"
+  max_steps: 200_000
+  batch_size: 24           # 12 per GPU × 2 = 24 (T4 16GBfits)
+  val_batch_size: 12
+  num_sources: 2
+  grad_clip: 1.0
+  gradient_accumulation_steps: 2   # Effective batch = 48
+  precision: "16-mixed"             # FP16 saves memory
+  log_every_n_steps: 50
+  val_check_interval: 2500
+  num_sanity_val_steps: 2
+  early_stopping_patience: 10000
+  checkpoint_every_n_steps: 2500
+  resume_from_checkpoint: null      # Set to path forresumption
+
+  optimizer:
+    lr: 1e-3
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    warmup_steps: 1000
+
+  loss:
+    si_snr_weight: 1.0
+    crm_weight: 0.0
+    stft_weight: 0.0
+    perceptual_weight: 0.0
+
+  # Phase 1: audio only
+  disable_visual: true
+  n_sources: 2
+
+  model:
+    n_sources: 2
+
+  data:
+    index_file: "/kaggle/working/cache/index.json"
+    cache_dir: "/kaggle/working/cache"
+    num_workers: 4          # 2 per GPU
+    seed: 42

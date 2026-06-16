@@ -7,6 +7,7 @@ Usage:
     python scripts/train.py train=phase2
     python scripts/train.py train=phase3
 """
+
 import os
 import sys
 
@@ -33,7 +34,9 @@ class CurriculumCallback(pl.Callback):
         super().__init__()
         self.datamodule = datamodule
 
-    def on_train_batch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch, batch_idx: int):
+    def on_train_batch_start(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch, batch_idx: int
+    ):
         self.datamodule.update_curriculum(trainer.global_step)
 
 
@@ -89,7 +92,9 @@ def main(cfg: DictConfig) -> None:
         index_file=index_file,
         n_sources=n_sources,
         batch_size=cfg.train.get("batch_size", cfg.data.get("train_batch_size", 8)),
-        val_batch_size=cfg.train.get("val_batch_size", cfg.data.get("val_batch_size", 4)),
+        val_batch_size=cfg.train.get(
+            "val_batch_size", cfg.data.get("val_batch_size", 4)
+        ),
         num_workers=cfg.data.get("num_workers", 4),
         include_visual=include_visual,
         seed=cfg.data.get("seed", 42),
@@ -142,8 +147,7 @@ def main(cfg: DictConfig) -> None:
         "max_steps": cfg.train.max_steps,
         "gradient_clip_val": cfg.train.get("grad_clip", 1.0),
         "gradient_clip_algorithm": "norm",
-        "accumulate_grad_batches": cfg.train.get(
-            "gradient_accumulation_steps", 1),
+        "accumulate_grad_batches": cfg.train.get("gradient_accumulation_steps", 1),
         "callbacks": callbacks,
         "logger": logger,
         "log_every_n_steps": cfg.train.get("log_every_n_steps", 100),
@@ -152,6 +156,14 @@ def main(cfg: DictConfig) -> None:
         "accelerator": "auto",
         "devices": 1,
     }
+
+    trainer_args.update(
+        {
+            "strategy": "ddp_find_unused_parameters_false",
+            "devices": 2,
+            "num_nodes": 1,
+        }
+    )
 
     # Precision
     precision = cfg.train.get("precision")
@@ -170,9 +182,7 @@ def main(cfg: DictConfig) -> None:
     print("Starting training...")
     print("=" * 60)
     trainer.fit(
-        model,
-        datamodule=datamodule,
-        ckpt_path=resume_ckpt if resume_ckpt else None
+        model, datamodule=datamodule, ckpt_path=resume_ckpt if resume_ckpt else None
     )
 
     print("\n" + "=" * 60)
