@@ -158,6 +158,7 @@ def main(cfg: DictConfig) -> None:
         "logger": logger,
         "log_every_n_steps": cfg.train.get("log_every_n_steps", 100),
         "val_check_interval": cfg.train.get("val_check_interval", 5000),
+        "check_val_every_n_epoch": cfg.train.get("check_val_every_n_epoch", None),
         "num_sanity_val_steps": cfg.train.get("num_sanity_val_steps", 2),
         "accelerator": trainer_cfg.get("accelerator", "auto"),
         "devices": trainer_cfg.get("devices", 1),

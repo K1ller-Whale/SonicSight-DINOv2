@@ -11,6 +11,7 @@ train:
   precision: null
   log_every_n_steps: 100
   val_check_interval: 5000
+  check_val_every_n_epoch: null
   num_sanity_val_steps: 2
   checkpoint_every_n_steps: 5000
   resume_from_checkpoint: null

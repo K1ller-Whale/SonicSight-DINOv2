@@ -65,7 +65,10 @@ class ISTFTModule(torch.nn.Module):
         mask is real+imag channels; complex multiply with mixture STFT
         then inverse STFT to waveform.
         """
-        # Rebuild complex spectrogram from mask
+        # ComplexHalf is poorly supported, so keep iSTFT complex math in fp32
+        # even when Lightning runs the surrounding model in mixed precision.
+        mask = mask.float()
+        mixture_spec = mixture_spec.float()
         complex_mask = torch.complex(mask[:, 0], mask[:, 1])
         complex_mix = torch.complex(mixture_spec[:, 0], mixture_spec[:, 1])
         separated = complex_mask * complex_mix  # element-wise complex multiply

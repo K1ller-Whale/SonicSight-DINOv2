@@ -256,7 +256,7 @@ class SeparatorModule(pl.LightningModule):
                 si_snr_losses.append(loss)
             si_snr_loss = torch.stack(si_snr_losses).mean()
             total_loss = si_snr_loss
-            self.log("train/si_snr_loss", si_snr_loss, prog_bar=True)
+            self.log("train/si_snr_loss", si_snr_loss, prog_bar=True, batch_size=B)
 
         elif self.phase == "phase2":
             # Phase 2: SI-SNR + entropy
@@ -267,8 +267,8 @@ class SeparatorModule(pl.LightningModule):
             si_snr_loss = torch.stack(si_snr_losses).mean()
             entropy_loss = self._compute_attention_entropy()
             total_loss = si_snr_loss + 0.1 * entropy_loss
-            self.log("train/si_snr_loss", si_snr_loss, prog_bar=True)
-            self.log("train/entropy_loss", entropy_loss, prog_bar=True)
+            self.log("train/si_snr_loss", si_snr_loss, prog_bar=True, batch_size=B)
+            self.log("train/entropy_loss", entropy_loss, prog_bar=True, batch_size=B)
 
         else:  # phase3
             # Phase 3: SI-SNR + cRM (shared PIT) + STFT + Perceptual
@@ -307,12 +307,12 @@ class SeparatorModule(pl.LightningModule):
             perceptual_loss = self.perceptual(aligned_preds, target_waveforms)
 
             total_loss = si_snr_loss + alpha * crm_loss + beta * stft_loss + gamma * perceptual_loss
-            self.log("train/si_snr_loss", si_snr_loss, prog_bar=True)
-            self.log("train/crm_loss", crm_loss, prog_bar=True)
-            self.log("train/stft_loss", stft_loss, prog_bar=True)
-            self.log("train/perceptual_loss", perceptual_loss, prog_bar=True)
+            self.log("train/si_snr_loss", si_snr_loss, prog_bar=True, batch_size=B)
+            self.log("train/crm_loss", crm_loss, prog_bar=True, batch_size=B)
+            self.log("train/stft_loss", stft_loss, prog_bar=True, batch_size=B)
+            self.log("train/perceptual_loss", perceptual_loss, prog_bar=True, batch_size=B)
 
-        self.log("train/total_loss", total_loss, prog_bar=True)
+        self.log("train/total_loss", total_loss, prog_bar=True, batch_size=B)
         return total_loss
 
     def _predict_masks(self, mixture_stft: torch.Tensor) -> torch.Tensor:
@@ -391,7 +391,7 @@ class SeparatorModule(pl.LightningModule):
 
         # Log as sisnri (negative loss = higher is better)
         sisnri = -si_snr_loss
-        self.log("val/sisnri", sisnri, prog_bar=True)
+        self.log("val/sisnri", sisnri, prog_bar=True, batch_size=B, sync_dist=True)
         return sisnri
 
     def configure_optimizers(self):
