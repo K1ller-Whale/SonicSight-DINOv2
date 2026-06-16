@@ -10,10 +10,12 @@ Usage:
 
 import os
 import sys
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import hydra
+import torch
 from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -38,6 +40,48 @@ class CurriculumCallback(pl.Callback):
         self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch, batch_idx: int
     ):
         self.datamodule.update_curriculum(trainer.global_step)
+
+
+def _resolve_num_devices(trainer_cfg: DictConfig) -> int:
+    """Best-effort estimate of devices Lightning will use for progress display."""
+    devices = trainer_cfg.get("devices", 1)
+    accelerator = str(trainer_cfg.get("accelerator", "auto")).lower()
+
+    if isinstance(devices, int):
+        if devices == -1:
+            return max(1, torch.cuda.device_count())
+        return max(1, devices)
+
+    if isinstance(devices, str):
+        value = devices.strip().lower()
+        if value in {"auto", "-1"}:
+            if accelerator in {"auto", "gpu", "cuda"} and torch.cuda.is_available():
+                return max(1, torch.cuda.device_count())
+            return 1
+        if "," in value:
+            return max(1, len([item for item in value.split(",") if item.strip()]))
+        try:
+            parsed = int(value)
+        except ValueError:
+            return 1
+        if parsed == -1:
+            return max(1, torch.cuda.device_count())
+        return max(1, parsed)
+
+    try:
+        return max(1, len(devices))
+    except TypeError:
+        return 1
+
+
+def _estimate_batches_per_epoch(num_samples: int, batch_size: int, num_devices: int) -> int:
+    per_device_samples = math.ceil(num_samples / max(1, num_devices))
+    return max(1, math.ceil(per_device_samples / batch_size))
+
+
+def _derive_max_epochs(max_steps: int, batches_per_epoch: int, accumulate_grad_batches: int) -> int:
+    optimizer_steps_per_epoch = max(1, math.ceil(batches_per_epoch / accumulate_grad_batches))
+    return max(1, math.ceil(max_steps / optimizer_steps_per_epoch))
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
@@ -100,6 +144,28 @@ def main(cfg: DictConfig) -> None:
         seed=cfg.data.get("seed", 42),
         curriculum_schedule=curriculum_schedule if curriculum_schedule else None,
     )
+    trainer_cfg = cfg.get("trainer", {})
+    datamodule.setup(stage="fit")
+    num_devices = _resolve_num_devices(trainer_cfg)
+    batches_per_epoch = _estimate_batches_per_epoch(
+        num_samples=len(datamodule.train_ds),
+        batch_size=datamodule.batch_size,
+        num_devices=num_devices,
+    )
+    accumulate_grad_batches = cfg.train.get("gradient_accumulation_steps", 1)
+    max_epochs = cfg.train.get("max_epochs")
+    if max_epochs is None:
+        max_epochs = _derive_max_epochs(
+            max_steps=cfg.train.max_steps,
+            batches_per_epoch=batches_per_epoch,
+            accumulate_grad_batches=accumulate_grad_batches,
+        )
+    print(
+        "Estimated schedule: "
+        f"{len(datamodule.train_ds):,} train samples, "
+        f"{batches_per_epoch:,} batches/epoch/device, "
+        f"{max_epochs:,} epochs for {cfg.train.max_steps:,} optimizer steps"
+    )
 
     # ------------------------------------------------------------------ #
     # Callbacks
@@ -148,12 +214,12 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # Trainer
     # ------------------------------------------------------------------ #
-    trainer_cfg = cfg.get("trainer", {})
     trainer_args = {
         "max_steps": cfg.train.max_steps,
+        "max_epochs": max_epochs,
         "gradient_clip_val": cfg.train.get("grad_clip", 1.0),
         "gradient_clip_algorithm": "norm",
-        "accumulate_grad_batches": cfg.train.get("gradient_accumulation_steps", 1),
+        "accumulate_grad_batches": accumulate_grad_batches,
         "callbacks": callbacks,
         "logger": logger,
         "log_every_n_steps": cfg.train.get("log_every_n_steps", 100),

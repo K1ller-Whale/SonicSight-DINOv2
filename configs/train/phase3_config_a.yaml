@@ -3,6 +3,7 @@ train:
   name: "phase3_config_a"
   phase: "phase3"
   max_steps: 100_000
+  max_epochs: null
   batch_size: 8
   val_batch_size: 4
   num_sources: 2  # progressive: 2→3 at 20K, 3→4 at 40K

@@ -3,6 +3,7 @@ train:
   name: "phase1_audio_only_kaggle"
   phase: "phase1"
   max_steps: 200_000
+  max_epochs: null
   batch_size: 24           # 12 per GPU × 2 = 24 (T4 16GBfits)
   val_batch_size: 12
   num_sources: 2

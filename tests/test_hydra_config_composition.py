@@ -32,6 +32,7 @@ def test_train_configs_compose_without_double_nesting(train_config):
     assert "model" not in cfg.model
     assert cfg.train.phase in {"phase1", "phase2", "phase3"}
     assert cfg.train.max_steps > 0
+    assert cfg.train.max_epochs is None
     assert cfg.train.check_val_every_n_epoch is None
 
 
@@ -45,3 +46,9 @@ def test_phase1_kaggle_config_has_expected_paths_and_phase():
     assert cfg.outputs.checkpoint_dir == "/kaggle/working/checkpoints"
     assert cfg.train.val_check_interval == 2500
     assert cfg.train.check_val_every_n_epoch is None
+
+
+def test_train_max_epochs_can_be_overridden():
+    cfg = _compose("train=phase1_kaggle", "train.max_epochs=12")
+
+    assert cfg.train.max_epochs == 12
