@@ -1,0 +1,53 @@
+﻿# @package _global_
+train:
+  name: "phase1_audio_only_lightning"
+  phase: "phase1"
+  max_steps: 200_000
+  max_epochs: null
+  batch_size: 20
+  val_batch_size: 8
+  num_sources: 2
+  grad_clip: 1.0
+  gradient_accumulation_steps: 4
+  precision: "16-mixed"
+  log_every_n_steps: 100
+  val_check_interval: 5000
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 2
+  early_stopping_patience: 10000
+  checkpoint_every_n_steps: 5000
+  resume_from_checkpoint: null
+
+  optimizer:
+    lr: 1e-3
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+
+  scheduler:
+    warmup_steps: 1000
+
+  loss:
+    si_snr_weight: 1.0
+    crm_weight: 0.0
+    stft_weight: 0.0
+    perceptual_weight: 0.0
+
+  disable_visual: true
+  n_sources: 2
+
+model:
+  n_sources: 2
+
+data:
+  index_file: "./cache/index.json"
+  cache_dir: "./cache"
+  num_workers: 2
+  seed: 42
+
+trainer:
+  accelerator: "gpu"
+  devices: 1
+
+outputs:
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"

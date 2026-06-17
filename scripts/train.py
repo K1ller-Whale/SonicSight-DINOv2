@@ -176,7 +176,7 @@ def main(cfg: DictConfig) -> None:
     log_dir = logger_cfg.get("save_dir") or outputs_cfg.get("log_dir", "logs")
 
     callbacks = [
-        LearningRateMonitor(logging_interval="step"),
+        LearningRateMonitor(logging_interval="epoch"),
         ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename=f"{{step}}-{phase}-" + "{val/sisnri:.2f}",
