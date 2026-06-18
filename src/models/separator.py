@@ -83,10 +83,10 @@ class SeparatorModule(pl.LightningModule):
         """Enable gradients only for parameters used by the active phase."""
         if self.phase == "phase1":
             self._set_trainable(self.audio_unet, True)
-            self._set_trainable(self.bottleneck_proj, False)
+            self._set_trainable(self.bottleneck_proj, True)
             self._set_trainable(self.visual_proj, False)
             self._set_trainable(self.cross_attn, False)
-            self.source_queries.requires_grad_(False)
+            self.source_queries.requires_grad_(True)
         elif self.phase == "phase2":
             self._set_trainable(self.audio_unet, False)
             self._set_trainable(self.bottleneck_proj, True)
@@ -233,8 +233,9 @@ class SeparatorModule(pl.LightningModule):
 
             decoder_input = torch.stack(decoder_inputs, dim=1)  # [B, N, 512, 9, 19]
         else:
-            # Phase 1 or no visual features: broadcast audio bottleneck to all sources
-            decoder_input = bottleneck.unsqueeze(1).expand(-1, self.n_sources, -1, -1, -1)
+            # Phase 1: per-source decoder input via learned source query offsets
+            sq = self.source_queries[:self.n_sources].view(1, self.n_sources, 512, 1, 1)
+            decoder_input = bottleneck.unsqueeze(1) + sq
 
         # Cache intermediates for _predict_masks
         self._cached_bottleneck = bottleneck

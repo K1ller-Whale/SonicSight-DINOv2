@@ -4,19 +4,19 @@ train:
   phase: "phase1"
   max_steps: 200_000
   max_epochs: null
-  batch_size: 20
-  val_batch_size: 8
+  batch_size: 24           # 12 per GPU × 2 = 24 (T4 16GBfits)
+  val_batch_size: 12
   num_sources: 2
   grad_clip: 1.0
-  gradient_accumulation_steps: 4
-  precision: "16-mixed"
-  log_every_n_steps: 100
-  val_check_interval: 5000
+  gradient_accumulation_steps: 2   # Effective batch = 48
+  precision: "16-mixed"             # FP16 saves memory
+  log_every_n_steps: 50
+  val_check_interval: 2500
   check_val_every_n_epoch: null
   num_sanity_val_steps: 2
   early_stopping_patience: 10000
-  checkpoint_every_n_steps: 5000
-  resume_from_checkpoint: null
+  checkpoint_every_n_steps: 2500
+  resume_from_checkpoint: null      # Set to path forresumption
 
   optimizer:
     lr: 1e-3
@@ -32,6 +32,7 @@ train:
     stft_weight: 0.0
     perceptual_weight: 0.0
 
+  # Phase 1: audio only
   disable_visual: true
   n_sources: 2
 
@@ -45,8 +46,8 @@ data:
   seed: 42
 
 trainer:
-  accelerator: "gpu"
-  devices: 1
+  accelerator: "auto"
+  devices: "auto"
 
 outputs:
   checkpoint_dir: "./checkpoints"

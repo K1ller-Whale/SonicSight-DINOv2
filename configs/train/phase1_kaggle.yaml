@@ -40,9 +40,9 @@ model:
   n_sources: 2
 
 data:
-  index_file: "/kaggle/working/cache/index.json"
-  cache_dir: "/kaggle/working/cache"
-  num_workers: 4          # 2 per GPU
+  index_file: "./cache/index.json"
+  cache_dir: "./cache"
+  num_workers: 2
   seed: 42
 
 trainer:
@@ -50,5 +50,6 @@ trainer:
   devices: "auto"
 
 outputs:
-  checkpoint_dir: "/kaggle/working/checkpoints"
-  log_dir: "/kaggle/working/logs"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+
