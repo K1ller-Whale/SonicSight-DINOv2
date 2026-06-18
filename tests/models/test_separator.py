@@ -6,7 +6,7 @@ SPEC 11.3, 11.4: Forward pass, training step, phase-aware training.
 import pytest
 import torch
 from einops import rearrange
-from src.models.separator import SeparatorModule
+from src.models.separator import JointMaskHead, SeparatorModule
 
 
 @pytest.fixture
@@ -101,6 +101,30 @@ class TestSeparatorModuleForward:
         # 96kHz output for 601 STFT frames at hop=160
         # Expected: ~96000 samples (6s * 16kHz)
         assert output.shape[-1] > 90000  # reasonable waveform length
+
+
+class TestJointMaskHead:
+    """Test source-competitive Phase 1 bottleneck masking."""
+
+    def test_zero_initialized_softmax_masks(self):
+        head = JointMaskHead(bottleneck_channels=512, n_sources=2)
+        final_conv = head.head[-1]
+
+        assert torch.count_nonzero(final_conv.weight) == 0
+        assert torch.count_nonzero(final_conv.bias) == 0
+
+        bottleneck = torch.randn(2, 512, 9, 19)
+        masks = head(bottleneck)
+
+        assert masks.shape == (2, 2, 512, 9, 19)
+        torch.testing.assert_close(
+            masks.sum(dim=1),
+            torch.ones(2, 512, 9, 19),
+        )
+        torch.testing.assert_close(
+            masks[:, 0],
+            torch.full_like(masks[:, 0], 0.5),
+        )
 
 
 class TestSeparatorModuleTrainingStep:

@@ -5,6 +5,7 @@ SPEC 11.2, 7.1: Synthetic mixtures from clean (source, video) pairs.
 import json
 import os
 import random
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -75,6 +76,21 @@ class MixAndSepareDataset(Dataset):
         if not self.clips:
             raise ValueError(f"No clips found for split '{split}'")
 
+        self.clip_categories = {
+            cid: self._extract_category(cid, self._all_meta[cid])
+            for cid in self.clips
+        }
+        self.category_to_clips: Dict[str, List[str]] = {}
+        for cid in self.clips:
+            category = self.clip_categories[cid]
+            self.category_to_clips.setdefault(category, []).append(cid)
+        self.categories = sorted(self.category_to_clips)
+        if len(self.categories) < self.n_sources:
+            raise ValueError(
+                f"Need at least {self.n_sources} distinct categories for split "
+                f"'{split}', found {len(self.categories)}"
+            )
+
         self.cache_dir = cache_dir or os.path.dirname(index_file)
         self._stft = STFTModule()
 
@@ -125,6 +141,94 @@ class MixAndSepareDataset(Dataset):
         mixture = scaled.sum(dim=0)  # [L]
         return mixture, gains, scaled
 
+    @staticmethod
+    def _coerce_category(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                coerced = MixAndSepareDataset._coerce_category(item)
+                if coerced is not None:
+                    return coerced
+            return None
+        if isinstance(value, dict):
+            for key in ("category", "instrument", "label", "class", "name"):
+                coerced = MixAndSepareDataset._coerce_category(value.get(key))
+                if coerced is not None:
+                    return coerced
+            return None
+        text = str(value).strip().lower()
+        return text or None
+
+    @staticmethod
+    def _category_from_path(path: str) -> Optional[str]:
+        parts = Path(path).parts if path else ()
+        for part in reversed(parts[:-1]):
+            name = Path(part).name.strip().lower()
+            if name and not name.startswith("source") and name not in {"audio", "wav", "wavs"}:
+                return name.split("_")[0]
+        return None
+
+    @classmethod
+    def _extract_category(cls, clip_id: str, meta: Dict[str, Any]) -> str:
+        category_keys = (
+            "category",
+            "categories",
+            "instrument",
+            "instruments",
+            "source_category",
+            "source_categories",
+            "source_type",
+            "source_types",
+            "class",
+            "classes",
+            "label",
+            "labels",
+        )
+        for key in category_keys:
+            category = cls._coerce_category(meta.get(key))
+            if category is not None:
+                return category
+
+        source_paths = meta.get("source_paths", [])
+        if source_paths:
+            category = cls._category_from_path(source_paths[0])
+            if category is not None:
+                return category
+
+        identity = cls._coerce_category(meta.get("identity"))
+        if identity is not None:
+            return identity
+
+        return clip_id.strip().lower().split("_")[0]
+
+    def _sample_cross_category_clip_ids(self, idx: int) -> List[str]:
+        if len(self.categories) < self.n_sources:
+            raise ValueError(
+                f"Need at least {self.n_sources} distinct categories, "
+                f"found {len(self.categories)}"
+            )
+
+        if self.split == "train":
+            categories = random.sample(self.categories, self.n_sources)
+            return [
+                random.choice(self.category_to_clips[category])
+                for category in categories
+            ]
+
+        start = idx % len(self.categories)
+        categories = [
+            self.categories[(start + offset) % len(self.categories)]
+            for offset in range(self.n_sources)
+        ]
+        clip_cycle = idx // len(self.categories)
+        return [
+            self.category_to_clips[category][
+                (clip_cycle + source_idx) % len(self.category_to_clips[category])
+            ]
+            for source_idx, category in enumerate(categories)
+        ]
+
     # ------------------------------------------------------------------ #
     # Dataset protocol
     # ------------------------------------------------------------------ #
@@ -137,15 +241,12 @@ class MixAndSepareDataset(Dataset):
             raise ValueError(
                 f"Not enough clips ({len(self.clips)}) for n_sources={self.n_sources}"
             )
-        if self.split == "train":
-            clip_ids = random.sample(self.clips, self.n_sources)
-        else:
-            # Deterministic: use idx to pick starting clip
-            start = idx % len(self.clips)
-            clip_ids = [
-                self.clips[(start + k) % len(self.clips)]
-                for k in range(self.n_sources)
-            ]
+        clip_ids = self._sample_cross_category_clip_ids(idx)
+        source_categories = [self.clip_categories[clip_id] for clip_id in clip_ids]
+        if len(set(source_categories)) != len(source_categories):
+            raise RuntimeError(
+                f"Cross-category sampling failed: {source_categories}"
+            )
 
         # Load waveforms per source
         source_waves = []
@@ -177,6 +278,7 @@ class MixAndSepareDataset(Dataset):
             "source_gains": source_gains,
             "clip_ids": clip_ids,
             "clip_id": "+".join(clip_ids),
+            "source_categories": source_categories,
         }
 
         # Visual features - load per source separately (no averaging)

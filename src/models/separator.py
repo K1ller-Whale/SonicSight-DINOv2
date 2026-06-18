@@ -5,6 +5,7 @@ SPEC 11.3, 11.4: Three-phase training with differential learning rates.
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from einops import rearrange
 from src.audio.unet import AudioUNet
@@ -14,6 +15,33 @@ from src.fusion.cross_attention import CrossModalAttentionModule
 from src.loss.separation import SISNRLoss, CRMLoss, MultiScaleSTFTLoss, PerceptualLoss
 from src.loss.pit_wrapper import PITLossWrapper
 from typing import Optional, Dict, Any, List
+
+
+class JointMaskHead(nn.Module):
+    """Joint source-competitive bottleneck mask head."""
+
+    def __init__(self, bottleneck_channels: int, n_sources: int):
+        super().__init__()
+        self.bottleneck_channels = bottleneck_channels
+        self.n_sources = n_sources
+        self.head = nn.Sequential(
+            nn.Conv2d(bottleneck_channels, bottleneck_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(
+                bottleneck_channels,
+                bottleneck_channels * n_sources,
+                kernel_size=1,
+            ),
+        )
+        final_conv = self.head[-1]
+        nn.init.zeros_(final_conv.weight)
+        nn.init.zeros_(final_conv.bias)
+
+    def forward(self, bottleneck: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = bottleneck.shape
+        masks = self.head(bottleneck)
+        masks = masks.view(B, self.n_sources, C, H, W)
+        return F.softmax(masks, dim=1)
 
 
 class SeparatorModule(pl.LightningModule):
@@ -38,6 +66,10 @@ class SeparatorModule(pl.LightningModule):
         # --- Components ---
         self.dinov2 = DINOv2FeatureExtractor()
         self.audio_unet = AudioUNet()
+        self.joint_mask_head = JointMaskHead(
+            bottleneck_channels=512,
+            n_sources=self.n_sources,
+        )
         # Visual projection: D_v=768 -> D_a=512, no bias (SPEC 11.3)
         self.visual_proj = nn.Linear(768, 512, bias=False)
         # Bottleneck projection: Conv1x1 equivalent (512 -> 512)
@@ -50,7 +82,7 @@ class SeparatorModule(pl.LightningModule):
         bottleneck_frame_idx = torch.tensor([w_to_frame[i % 19] for i in range(171)], dtype=torch.long)
         self.register_buffer("bottleneck_frame_idx", bottleneck_frame_idx)
         
-        # Source query tokens: allocate MAX sources upfront, slice in forward
+        # Source query tokens: allocate MAX sources upfront for visual phases.
         self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
         # iSTFT for waveform reconstruction
         data_cfg = cfg.get("data", {})
@@ -83,18 +115,21 @@ class SeparatorModule(pl.LightningModule):
         """Enable gradients only for parameters used by the active phase."""
         if self.phase == "phase1":
             self._set_trainable(self.audio_unet, True)
-            self._set_trainable(self.bottleneck_proj, True)
+            self._set_trainable(self.joint_mask_head, True)
+            self._set_trainable(self.bottleneck_proj, False)
             self._set_trainable(self.visual_proj, False)
             self._set_trainable(self.cross_attn, False)
-            self.source_queries.requires_grad_(True)
+            self.source_queries.requires_grad_(False)
         elif self.phase == "phase2":
             self._set_trainable(self.audio_unet, False)
+            self._set_trainable(self.joint_mask_head, False)
             self._set_trainable(self.bottleneck_proj, True)
             self._set_trainable(self.visual_proj, True)
             self._set_trainable(self.cross_attn, True)
             self.source_queries.requires_grad_(True)
         else:
             self._set_trainable(self.audio_unet, False)
+            self._set_trainable(self.joint_mask_head, False)
             self._set_trainable(self.audio_unet.decoder, True)
             for block in self.audio_unet.encoder.blocks[-2:]:
                 self._set_trainable(block, True)
@@ -165,6 +200,38 @@ class SeparatorModule(pl.LightningModule):
             return True
         return False
 
+    def phase1_forward(self, mixture_spec: torch.Tensor) -> torch.Tensor:
+        """Audio-only competitive separation path for Phase 1."""
+        target_shape = mixture_spec.shape[-2:]
+
+        bottleneck, skips = self.audio_unet.encoder(mixture_spec)
+        self._clear_cache()
+
+        masks = self.joint_mask_head(bottleneck)
+        decoder_inputs = []
+        source_outputs = []
+
+        for i in range(self.n_sources):
+            masked_features = bottleneck * masks[:, i]
+            decoder_inputs.append(masked_features)
+
+            mask = self.audio_unet.decoder(
+                masked_features,
+                skips,
+                target_shape=target_shape,
+            )
+            mask = torch.tanh(mask)
+            source_outputs.append(self.istft(mask, mixture_spec))
+
+        decoder_input = torch.stack(decoder_inputs, dim=1)
+        self._cached_bottleneck = bottleneck
+        self._cached_bottleneck_flat = None
+        self._cached_skips = skips
+        self._cached_decoder_input = decoder_input
+        self._cached_attn_weights = None
+
+        return torch.stack(source_outputs, dim=1)
+
     def forward(self, mixture_stft: torch.Tensor,
                 video_frames: Optional[torch.Tensor] = None,
                 visual_features: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -176,8 +243,10 @@ class SeparatorModule(pl.LightningModule):
         Returns:
             separated_waveforms: [B, N_sources, L]
         """
+        if self.phase == "phase1" or visual_features is None:
+            return self.phase1_forward(mixture_stft)
+
         B = mixture_stft.shape[0]
-        device = mixture_stft.device
         target_shape = mixture_stft.shape[-2:]  # [F, T]
 
         # 1. Audio U-Net encoder -> bottleneck [B, 512, 9, 19]
@@ -187,55 +256,49 @@ class SeparatorModule(pl.LightningModule):
         self._clear_cache()
 
         # 5. Cross-modal attention
-        have_visual = (visual_features is not None) and self.phase != "phase1"
         bottleneck_flat = None
 
-        if have_visual:
-            # 2. Flatten bottleneck: [B, 512, 9, 19] -> [B, 171, 512]
-            bottleneck_flat = rearrange(bottleneck, "B C H W -> B (H W) C")
+        # 2. Flatten bottleneck: [B, 512, 9, 19] -> [B, 171, 512]
+        bottleneck_flat = rearrange(bottleneck, "B C H W -> B (H W) C")
 
-            # 3. Bottleneck projection (Conv1x1 equivalent)
-            bottleneck_flat = self.bottleneck_proj(bottleneck_flat)  # [B, 171, 512]
-            decoder_inputs = []
-            self._cached_attn_weights = []
+        # 3. Bottleneck projection (Conv1x1 equivalent)
+        bottleneck_flat = self.bottleneck_proj(bottleneck_flat)  # [B, 171, 512]
+        decoder_inputs = []
+        self._cached_attn_weights = []
 
-            def attn_hook(module, input, output):
-                if isinstance(output, tuple) and len(output) == 2 and output[1] is not None:
-                    self._cached_attn_weights.append(output[1].detach())
+        def attn_hook(module, input, output):
+            if isinstance(output, tuple) and len(output) == 2 and output[1] is not None:
+                self._cached_attn_weights.append(output[1].detach())
 
-            for n in range(self.n_sources):
-                vkv_n = self.visual_proj(visual_features[:, n])  # [B, 150, 1024, 512]
-                vkv_n_aligned = vkv_n[:, self.bottleneck_frame_idx]  # [B, 171, 1024, 512]
+        for n in range(self.n_sources):
+            vkv_n = self.visual_proj(visual_features[:, n])  # [B, 150, 1024, 512]
+            vkv_n_aligned = vkv_n[:, self.bottleneck_frame_idx]  # [B, 171, 1024, 512]
 
-                # Per-source, per-position local attention
-                q = rearrange(bottleneck_flat, "B P D -> (B P) 1 D")
-                kv = rearrange(vkv_n_aligned, "B P K D -> (B P) K D")
-                # For localisation, we also need to capture these weights, so need_weights=True
-                attended_tuple = self.cross_attn(q, kv, need_weights=True, average_attn_weights=False)
-                attended = attended_tuple[0] if isinstance(attended_tuple, tuple) else attended_tuple
-                attended = rearrange(attended, "(B P) 1 D -> B P D", B=B)  # [B, 171, 512]
+            # Per-source, per-position local attention
+            q = rearrange(bottleneck_flat, "B P D -> (B P) 1 D")
+            kv = rearrange(vkv_n_aligned, "B P K D -> (B P) K D")
+            # For localisation, we also need to capture these weights, so need_weights=True
+            attended_tuple = self.cross_attn(q, kv, need_weights=True, average_attn_weights=False)
+            attended = attended_tuple[0] if isinstance(attended_tuple, tuple) else attended_tuple
+            attended = rearrange(attended, "(B P) 1 D -> B P D", B=B)  # [B, 171, 512]
 
-                bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
-                decoder_inputs.append(bottleneck_out_n)
+            bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
+            decoder_inputs.append(bottleneck_out_n)
 
-                # Source query tokens for entropy / temporal signal
-                hooks = []
-                for block in self.cross_attn.blocks:
-                    hooks.append(block.attn.register_forward_hook(attn_hook))
+            # Source query tokens for entropy / temporal signal
+            hooks = []
+            for block in self.cross_attn.blocks:
+                hooks.append(block.attn.register_forward_hook(attn_hook))
 
-                try:
-                    vkv_n_frame = vkv_n.mean(dim=2)  # [B, 150, 512]
-                    sq = self.source_queries[n:n+1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, 512]
-                    sq_attended_tuple = self.cross_attn(sq, vkv_n_frame, need_weights=True, average_attn_weights=False)
-                finally:
-                    for hook in hooks:
-                        hook.remove()
+            try:
+                vkv_n_frame = vkv_n.mean(dim=2)  # [B, 150, 512]
+                sq = self.source_queries[n:n+1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, 512]
+                sq_attended_tuple = self.cross_attn(sq, vkv_n_frame, need_weights=True, average_attn_weights=False)
+            finally:
+                for hook in hooks:
+                    hook.remove()
 
-            decoder_input = torch.stack(decoder_inputs, dim=1)  # [B, N, 512, 9, 19]
-        else:
-            # Phase 1: per-source decoder input via learned source query offsets
-            sq = self.source_queries[:self.n_sources].view(1, self.n_sources, 512, 1, 1)
-            decoder_input = bottleneck.unsqueeze(1) + sq
+        decoder_input = torch.stack(decoder_inputs, dim=1)  # [B, N, 512, 9, 19]
 
         # Cache intermediates for _predict_masks
         self._cached_bottleneck = bottleneck
@@ -289,6 +352,8 @@ class SeparatorModule(pl.LightningModule):
             si_snr_db = -si_snr_loss
             total_loss = si_snr_loss
             self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
             self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
 
         elif self.phase == "phase2":
@@ -302,6 +367,8 @@ class SeparatorModule(pl.LightningModule):
             entropy_loss = self._compute_attention_entropy()
             total_loss = si_snr_loss + 0.1 * entropy_loss
             self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
             self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
             self.log("train/entropy_loss", entropy_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
 
@@ -344,6 +411,8 @@ class SeparatorModule(pl.LightningModule):
 
             total_loss = si_snr_loss + alpha * crm_loss + beta * stft_loss + gamma * perceptual_loss
             self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
             self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
             self.log("train/crm_loss", crm_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
             self.log("train/stft_loss", stft_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
@@ -366,7 +435,11 @@ class SeparatorModule(pl.LightningModule):
             or self._cached_decoder_input is None):
             # Fallback: recompute if cache invalid (should not happen in normal training)
             bottleneck, skips = self.audio_unet.encoder(mixture_stft)
-            decoder_input = bottleneck.unsqueeze(1).expand(-1, self.n_sources, -1, -1, -1)
+            masks = self.joint_mask_head(bottleneck)
+            decoder_input = torch.stack(
+                [bottleneck * masks[:, i] for i in range(self.n_sources)],
+                dim=1,
+            )
         else:
             skips = self._cached_skips
             decoder_input = self._cached_decoder_input
@@ -429,6 +502,8 @@ class SeparatorModule(pl.LightningModule):
 
         # Log as positive SI-SNR dB; val/sisnri is kept for checkpoint compatibility.
         si_snr_db = -si_snr_loss
+        self.log("val/loss_value", si_snr_loss, prog_bar=False, batch_size=B, sync_dist=True)
+        self.log("val/si_snr_raw_db", si_snr_db, prog_bar=False, batch_size=B, sync_dist=True)
         self.log("val/sisnri", si_snr_db, prog_bar=False, batch_size=B, sync_dist=True)
         self.log("val/sisnr_db", si_snr_db, prog_bar=True, batch_size=B, sync_dist=True)
         return si_snr_db
