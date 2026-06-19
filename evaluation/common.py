@@ -66,9 +66,47 @@ def align_metric_waveforms(
         lengths.append(mixture_wave.shape[-1])
 
     metric_len = min(lengths)
+    if metric_len <= 0:
+        raise ValueError(
+            "Cannot evaluate metrics on an empty waveform. Check the source_paths "
+            "for this sample in index.json; at least one loaded source has zero samples."
+        )
+
     pred_waveforms = pred_waveforms[..., :metric_len]
     target_waveforms = target_waveforms[..., :metric_len]
     if mixture_wave is not None:
         mixture_wave = mixture_wave[..., :metric_len]
 
     return pred_waveforms, target_waveforms, mixture_wave
+
+
+def stable_si_snr(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-8,
+    floor_db: float = -100.0,
+) -> torch.Tensor:
+    """Compute finite SI-SNR for metric code, including silent/bad waveforms."""
+    device = source.device
+    source = torch.nan_to_num(source.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    target = torch.nan_to_num(target.float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+    if source.numel() == 0 or target.numel() == 0:
+        raise ValueError("Cannot compute SI-SNR for an empty waveform.")
+
+    source = source - source.mean()
+    target = target - target.mean()
+    target_energy = target.pow(2).sum()
+    if target_energy <= eps:
+        return torch.tensor(floor_db, device=device)
+
+    proj = (source * target).sum() / (target_energy + eps) * target
+    noise = source - proj
+    proj_energy = proj.pow(2).sum()
+    noise_energy = noise.pow(2).sum()
+    ratio = proj_energy / (noise_energy + eps)
+    si_snr = 10 * torch.log10(ratio + eps)
+
+    if not torch.isfinite(si_snr):
+        return torch.tensor(floor_db, device=device)
+    return torch.clamp(si_snr, min=floor_db)

@@ -29,17 +29,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
-from evaluation.common import align_metric_waveforms, maybe_to_device, resolve_n_sources
+from evaluation.common import (
+    align_metric_waveforms,
+    maybe_to_device,
+    resolve_n_sources,
+    stable_si_snr,
+)
 
 
 def compute_si_snr(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """SI-SNR for single source-target pair. Both [L]."""
-    source = source - source.mean()
-    target = target - target.mean()
-    target_energy = target.pow(2).sum()
-    proj = (source * target).sum() / (target_energy + 1e-8) * target
-    noise = proj - source
-    return 10 * torch.log10(proj.pow(2).sum() / (noise.pow(2).sum() + 1e-8))
+    return stable_si_snr(source, target)
 
 
 def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
@@ -73,6 +73,7 @@ def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
         for j in range(N):
             sisnr = compute_si_snr(pred_waveforms[i], target_waveforms[j])
             cost_matrix[i, j] = -sisnr.item()  # negative for minimization
+    cost_matrix = torch.nan_to_num(cost_matrix, nan=1e6, posinf=1e6, neginf=-1e6)
 
     # Find optimal assignment
     if N <= 3:
@@ -84,6 +85,8 @@ def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
             if cost < best_cost:
                 best_cost = cost
                 best_perm = perm
+        if best_perm is None:
+            best_perm = tuple(range(N))
         assignment = list(zip(range(N), best_perm))
     else:
         # Hungarian algorithm for N>3
