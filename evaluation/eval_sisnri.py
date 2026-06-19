@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
+from evaluation.common import align_metric_waveforms, maybe_to_device, resolve_n_sources
 
 
 def compute_si_snr(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -53,6 +54,9 @@ def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
     Returns:
         sisnri_per_source: [N] - SI-SNR improvement for each source (best permutation)
     """
+    pred_waveforms, target_waveforms, mixture_wave = align_metric_waveforms(
+        pred_waveforms, target_waveforms, mixture_wave
+    )
     N, L = pred_waveforms.shape
     if N == 1:
         sisnr_sep = compute_si_snr(pred_waveforms[0], target_waveforms[0])
@@ -130,11 +134,12 @@ def evaluate_sisnri(args) -> Dict:
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
     model.eval()
+    n_sources = resolve_n_sources(model, getattr(args, "n_sources", None))
 
     # DataModule
     dm = AudioVisualDataModule(
         index_file=args.index_file,
-        n_sources=args.n_sources,
+        n_sources=n_sources,
         batch_size=1,
         num_workers=0,
         include_visual=(model.phase != "phase1"),
@@ -151,8 +156,8 @@ def evaluate_sisnri(args) -> Dict:
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
             target_waveforms = batch["target_waveforms"].to(device)  # [1, N, L]
-            visual_features = batch.get("visual_features")
-            video_frames = batch.get("video_frames")
+            visual_features = maybe_to_device(batch.get("visual_features"), device)
+            video_frames = maybe_to_device(batch.get("video_frames"), device)
 
             # Forward - route visual input appropriately
             if model.phase == "phase1":
@@ -196,7 +201,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate SI-SNRi with PIT on test set")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--index_file", type=str, default="cache/index.json", help="Dataset index")
-    parser.add_argument("--n_sources", type=int, default=2, help="Number of sources")
+    parser.add_argument("--n_sources", type=int, default=None, help="Number of sources")
     parser.add_argument("--cpu", action="store_true", help="Force CPU")
     parser.add_argument("--log_every", type=int, default=50, help="Log every N batches")
     parser.add_argument("--output", type=str, default="outputs/eval_sisnri.json", help="Output JSON path")

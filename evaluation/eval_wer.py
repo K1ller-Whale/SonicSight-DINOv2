@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
+from evaluation.common import maybe_to_device, resolve_n_sources
 
 
 def resample_to_16kHz(waveform: torch.Tensor, orig_sr: int) -> torch.Tensor:
@@ -83,10 +84,11 @@ def evaluate_wer(args) -> Dict:
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
     model.eval()
+    n_sources = resolve_n_sources(model, getattr(args, "n_sources", None))
 
     dm = AudioVisualDataModule(
         index_file=args.index_file,
-        n_sources=args.n_sources,
+        n_sources=n_sources,
         batch_size=1,
         num_workers=0,
         include_visual=(model.phase != "phase1"),
@@ -113,8 +115,8 @@ def evaluate_wer(args) -> Dict:
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
-            visual_features = batch.get("visual_features")
-            video_frames = batch.get("video_frames")
+            visual_features = maybe_to_device(batch.get("visual_features"), device)
+            video_frames = maybe_to_device(batch.get("video_frames"), device)
 
             # Get clip_id for transcript lookup
             clip_id = batch.get("clip_id", [str(batch_idx)])[0] if batch.get("clip_id") else str(batch_idx)
@@ -180,7 +182,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--index_file", type=str, default="cache/index.json")
     parser.add_argument("--transcripts", type=str, default="data/transcripts.json")
-    parser.add_argument("--n_sources", type=int, default=2)
+    parser.add_argument("--n_sources", type=int, default=None)
     parser.add_argument("--asr_model", type=str, default="whisper")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--sample_rate", type=int, default=16000,

@@ -94,17 +94,27 @@ def evaluate_all(args) -> Dict:
     print("\n" + "=" * 60)
     print("4/5 Running WER evaluation...")
     print("=" * 60)
-    wer_args = argparse.Namespace(
-        checkpoint=args.checkpoint,
-        index_file=args.index_file,
-        transcripts=args.transcripts,
-        n_sources=args.n_sources,
-        asr_model=args.asr_model,
-        cpu=args.cpu,
-        sample_rate=args.sample_rate,
-        output="outputs/eval_wer.json",
-    )
-    wer_results = evaluate_wer(wer_args)
+    if os.path.exists(args.transcripts):
+        wer_args = argparse.Namespace(
+            checkpoint=args.checkpoint,
+            index_file=args.index_file,
+            transcripts=args.transcripts,
+            n_sources=args.n_sources,
+            asr_model=args.asr_model,
+            cpu=args.cpu,
+            sample_rate=args.sample_rate,
+            output="outputs/eval_wer.json",
+        )
+        wer_results = evaluate_wer(wer_args)
+    else:
+        print(f"  Skipping WER: transcripts file not found at {args.transcripts}")
+        wer_results = {
+            "wer_mean": -1.0,
+            "mixture_wer_mean": -1.0,
+            "num_samples": 0,
+            "per_sample": [],
+            "mixture_per_sample": [],
+        }
     print(f"  Separated WER mean: {wer_results['wer_mean']:.3f}")
     print(f"  Mixture WER mean:   {wer_results['mixture_wer_mean']:.3f}")
     print(f"  Samples:            {wer_results['num_samples']}")
@@ -172,7 +182,7 @@ def main():
     parser.add_argument("--index_file", type=str, default="cache/index.json", help="Dataset index file")
     parser.add_argument("--transcripts", type=str, default="data/transcripts.json", help="Transcripts JSON for WER")
     parser.add_argument("--gt_boxes", type=str, default=None, help="Ground-truth bounding boxes JSON for localisation")
-    parser.add_argument("--n_sources", type=int, default=2, help="Number of sources")
+    parser.add_argument("--n_sources", type=int, default=None, help="Number of sources")
     parser.add_argument("--asr_model", type=str, default="whisper", help="ASR model for WER evaluation")
     parser.add_argument("--cpu", action="store_true", help="Force CPU evaluation")
     parser.add_argument("--log_every", type=int, default=50, help="Log every N batches")

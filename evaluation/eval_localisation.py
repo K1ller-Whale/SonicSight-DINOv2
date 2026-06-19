@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
+from evaluation.common import maybe_to_device, resolve_n_sources
 
 
 def compute_iou(pred_box: Tuple[float, float, float, float],
@@ -186,6 +187,7 @@ def evaluate_localisation(args) -> Dict:
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
     model.eval()
+    n_sources = resolve_n_sources(model, getattr(args, "n_sources", None))
 
     # Load YOLO for GT boxes if requested
     yolo_detector = None
@@ -194,7 +196,7 @@ def evaluate_localisation(args) -> Dict:
 
     dm = AudioVisualDataModule(
         index_file=args.index_file,
-        n_sources=args.n_sources,
+        n_sources=n_sources,
         batch_size=1,
         num_workers=0,
         include_visual=True,
@@ -214,15 +216,14 @@ def evaluate_localisation(args) -> Dict:
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
-            visual_features = batch.get("visual_features")
-            video_frames = batch.get("video_frames")  # [1, N_frames, 3, H, W]
+            visual_features = maybe_to_device(batch.get("visual_features"), device)
+            video_frames = maybe_to_device(batch.get("video_frames"), device)  # [1, N_frames, 3, H, W]
             clip_id = batch.get("clip_id", [str(batch_idx)])[0] if batch.get("clip_id") else str(batch_idx)
 
             if visual_features is None and video_frames is None:
                 continue
 
             if video_frames is not None:
-                video_frames = video_frames.to(device)
                 _, _, _, H, W = video_frames.shape
 
             # Forward with attention hook to extract weights
@@ -273,7 +274,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate localisation accuracy (IoU) with top-50 patches and YOLOv8")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--index_file", type=str, default="cache/index.json")
-    parser.add_argument("--n_sources", type=int, default=2)
+    parser.add_argument("--n_sources", type=int, default=None)
     parser.add_argument("--gt_boxes", type=str, default=None,
                         help="Path to ground-truth bounding boxes JSON")
     parser.add_argument("--cpu", action="store_true")

@@ -261,12 +261,18 @@ class MixAndSepareDataset(Dataset):
         # Pad, mix, compute STFT
         source_waves = self._pad_waveforms(source_waves)
         mixture_wave, source_gains, scaled_sources = self._mix(source_waves)
-        # STFTModule enforces length=96000; pad/truncate mixture to match
-        if mixture_wave.shape[-1] != CLIP_LENGTH:
-            if mixture_wave.shape[-1] < CLIP_LENGTH:
-                mixture_wave = F.pad(mixture_wave, (0, CLIP_LENGTH - mixture_wave.shape[-1]))
+
+        # Keep targets and mixture on the same fixed clip length used by the
+        # model's iSTFT. This matters for .pt sources that were not already
+        # preprocessed to exactly 6 seconds.
+        if scaled_sources.shape[-1] != CLIP_LENGTH:
+            if scaled_sources.shape[-1] < CLIP_LENGTH:
+                scaled_sources = F.pad(
+                    scaled_sources, (0, CLIP_LENGTH - scaled_sources.shape[-1])
+                )
             else:
-                mixture_wave = mixture_wave[:CLIP_LENGTH]
+                scaled_sources = scaled_sources[..., :CLIP_LENGTH]
+        mixture_wave = scaled_sources.sum(dim=0)
         mixture_stft = self._stft(mixture_wave).squeeze(0)  # [2, F, T]
 
         # Targets are SCALED sources so they sum to mixture

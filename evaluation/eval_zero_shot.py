@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
+from evaluation.common import align_metric_waveforms, maybe_to_device, resolve_n_sources
 
 
 def compute_si_snr(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -49,6 +50,9 @@ def pit_si_snr(pred_waveforms: torch.Tensor, target_waveforms: torch.Tensor,
     PIT SI-SNR: find optimal permutation of sources that maximizes total SI-SNR.
     Returns list of SI-SNRi per source.
     """
+    pred_waveforms, target_waveforms, mixture_wave = align_metric_waveforms(
+        pred_waveforms, target_waveforms, mixture_wave
+    )
     N, L = pred_waveforms.shape
     if N == 1:
         sisnr_sep = compute_si_snr(pred_waveforms[0], target_waveforms[0])
@@ -118,11 +122,12 @@ def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
     model.eval()
+    n_sources = resolve_n_sources(model, getattr(args, "n_sources", None))
 
     # Create DataModule with filtered clips
     dm = AudioVisualDataModule(
         index_file=args.index_file,
-        n_sources=args.n_sources,
+        n_sources=n_sources,
         batch_size=1,
         num_workers=0,
         include_visual=(model.phase != "phase1"),
@@ -142,8 +147,8 @@ def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
             mixture_stft = batch["mixture_stft"].to(device)
             target_waveforms = batch["target_waveforms"].to(device)
 
-            visual_features = batch.get("visual_features")
-            video_frames = batch.get("video_frames")
+            visual_features = maybe_to_device(batch.get("visual_features"), device)
+            video_frames = maybe_to_device(batch.get("video_frames"), device)
 
             # Forward - route visual input appropriately
             if model.phase == "phase1":
@@ -243,7 +248,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate zero-shot generalization gap")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--index_file", type=str, default="cache/index.json")
-    parser.add_argument("--n_sources", type=int, default=2)
+    parser.add_argument("--n_sources", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seen_categories", type=str,
                         default="speech,music_instrument",

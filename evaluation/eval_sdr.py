@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
+from evaluation.common import align_metric_waveforms, maybe_to_device, resolve_n_sources
 
 
 def evaluate_sdr(args) -> Dict:
@@ -43,11 +44,12 @@ def evaluate_sdr(args) -> Dict:
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
     model.eval()
+    n_sources = resolve_n_sources(model, getattr(args, "n_sources", None))
 
     # DataModule
     dm = AudioVisualDataModule(
         index_file=args.index_file,
-        n_sources=args.n_sources,
+        n_sources=n_sources,
         batch_size=1,
         num_workers=0,
         include_visual=(model.phase != "phase1"),
@@ -70,8 +72,8 @@ def evaluate_sdr(args) -> Dict:
         for batch_idx, batch in enumerate(dataloader):
             mixture_stft = batch["mixture_stft"].to(device)
             target_waveforms = batch["target_waveforms"].to(device)  # [1, N, L]
-            visual_features = batch.get("visual_features")
-            video_frames = batch.get("video_frames")
+            visual_features = maybe_to_device(batch.get("visual_features"), device)
+            video_frames = maybe_to_device(batch.get("video_frames"), device)
 
             # Forward - route visual input appropriately
             if model.phase == "phase1":
@@ -87,9 +89,12 @@ def evaluate_sdr(args) -> Dict:
             B, N, L = pred_waveforms.shape
 
             for b in range(B):
+                est_tensor, ref_tensor, _ = align_metric_waveforms(
+                    pred_waveforms[b], target_waveforms[b]
+                )
                 # Convert to numpy for mir_eval
-                est_sources = pred_waveforms[b].cpu().numpy()  # [N, L]
-                ref_sources = target_waveforms[b].cpu().numpy()  # [N, L]
+                est_sources = est_tensor.cpu().numpy()  # [N, L]
+                ref_sources = ref_tensor.cpu().numpy()  # [N, L]
 
                 if mir_eval is not None:
                     # mir_eval expects (n_sources, n_samples) for both
@@ -127,7 +132,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate SDR/SIR/SAR on test set")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--index_file", type=str, default="cache/index.json", help="Dataset index")
-    parser.add_argument("--n_sources", type=int, default=2, help="Number of sources")
+    parser.add_argument("--n_sources", type=int, default=None, help="Number of sources")
     parser.add_argument("--cpu", action="store_true", help="Force CPU")
     parser.add_argument("--log_every", type=int, default=50, help="Log every N batches")
     parser.add_argument("--output", type=str, default="outputs/eval_sdr.json", help="Output JSON path")
