@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
-from evaluation.common import maybe_to_device, resolve_n_sources
+from evaluation.common import get_eval_device, maybe_to_device, resolve_n_sources
 
 
 def resample_to_16kHz(waveform: torch.Tensor, orig_sr: int) -> torch.Tensor:
@@ -68,7 +68,7 @@ def reconstruct_mixture(mixture_stft: torch.Tensor,
 
 def evaluate_wer(args) -> Dict:
     """Evaluate WER on separated sources and mixture baseline."""
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = get_eval_device(args)
 
     # Load ASR (Whisper)
     asr = None
@@ -185,6 +185,7 @@ def main():
     parser.add_argument("--n_sources", type=int, default=None)
     parser.add_argument("--asr_model", type=str, default="whisper")
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--device", type=str, default="auto", help="Evaluation device: auto, cuda, cuda:0, or cpu")
     parser.add_argument("--sample_rate", type=int, default=16000,
                         help="Original sample rate of audio (for resampling to 16kHz)")
     parser.add_argument("--output", type=str, default="outputs/eval_wer.json")

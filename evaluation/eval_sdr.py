@@ -32,12 +32,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
-from evaluation.common import align_metric_waveforms, maybe_to_device, resolve_n_sources
+from evaluation.common import (
+    align_metric_waveforms,
+    get_eval_device,
+    maybe_to_device,
+    non_silent_source_mask,
+    resolve_n_sources,
+)
 
 
 def evaluate_sdr(args) -> Dict:
     """Evaluate SDR/SIR/SAR using mir_eval on the test split."""
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = get_eval_device(args)
 
     # Load model
     print(f"Loading checkpoint from {args.checkpoint} ...")
@@ -61,6 +67,8 @@ def evaluate_sdr(args) -> Dict:
     sdr_scores = []
     sir_scores = []
     sar_scores = []
+    skipped_silent = 0
+    skipped_invalid = 0
 
     try:
         import mir_eval.separation
@@ -92,15 +100,31 @@ def evaluate_sdr(args) -> Dict:
                 est_tensor, ref_tensor, _ = align_metric_waveforms(
                     pred_waveforms[b], target_waveforms[b]
                 )
+
+                valid_ref = non_silent_source_mask(ref_tensor)
+                if not valid_ref.all():
+                    skipped_silent += 1
+                    continue
+
+                if not torch.isfinite(est_tensor).all() or not torch.isfinite(ref_tensor).all():
+                    skipped_invalid += 1
+                    continue
+
                 # Convert to numpy for mir_eval
                 est_sources = est_tensor.cpu().numpy()  # [N, L]
                 ref_sources = ref_tensor.cpu().numpy()  # [N, L]
 
                 if mir_eval is not None:
                     # mir_eval expects (n_sources, n_samples) for both
-                    sdr, sir, sar, _ = mir_eval.separation.bss_eval_sources(
-                        ref_sources, est_sources, compute_permutation=True
-                    )
+                    try:
+                        sdr, sir, sar, _ = mir_eval.separation.bss_eval_sources(
+                            ref_sources, est_sources, compute_permutation=True
+                        )
+                    except ValueError as exc:
+                        skipped_invalid += 1
+                        if skipped_invalid <= 3:
+                            print(f"  Skipping SDR sample {batch_idx}: {exc}")
+                        continue
                     sdr_scores.extend(sdr.tolist())
                     sir_scores.extend(sir.tolist())
                     sar_scores.extend(sar.tolist())
@@ -113,6 +137,11 @@ def evaluate_sdr(args) -> Dict:
             if (batch_idx + 1) % args.log_every == 0:
                 print(f"  Processed {batch_idx + 1}/{len(dataloader)} batches...")
 
+    if skipped_silent:
+        print(f"  Skipped {skipped_silent} SDR sample(s) with silent reference source(s).")
+    if skipped_invalid:
+        print(f"  Skipped {skipped_invalid} SDR sample(s) with invalid BSS Eval inputs.")
+
     result = {
         "SDR_mean": float(np.mean(sdr_scores)) if sdr_scores else 0.0,
         "SDR_std": float(np.std(sdr_scores)) if sdr_scores else 0.0,
@@ -124,6 +153,8 @@ def evaluate_sdr(args) -> Dict:
         "SIR_per_source": sir_scores,
         "SAR_per_source": sar_scores,
         "num_samples": len(sdr_scores),
+        "num_skipped_silent": skipped_silent,
+        "num_skipped_invalid": skipped_invalid,
     }
     return result
 
@@ -134,6 +165,7 @@ def main():
     parser.add_argument("--index_file", type=str, default="cache/index.json", help="Dataset index")
     parser.add_argument("--n_sources", type=int, default=None, help="Number of sources")
     parser.add_argument("--cpu", action="store_true", help="Force CPU")
+    parser.add_argument("--device", type=str, default="auto", help="Evaluation device: auto, cuda, cuda:0, or cpu")
     parser.add_argument("--log_every", type=int, default=50, help="Log every N batches")
     parser.add_argument("--output", type=str, default="outputs/eval_sdr.json", help="Output JSON path")
     args = parser.parse_args()

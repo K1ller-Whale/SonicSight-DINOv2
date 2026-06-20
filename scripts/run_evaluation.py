@@ -24,12 +24,15 @@ from evaluation.eval_sdr import evaluate_sdr
 from evaluation.eval_localisation import evaluate_localisation
 from evaluation.eval_wer import evaluate_wer
 from evaluation.eval_zero_shot import evaluate_zero_shot
+from evaluation.common import describe_device, get_eval_device
 
 
 def evaluate_all(args) -> Dict:
     """Run all evaluations and return combined results."""
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    print(f"Using device: {device}")
+    device = get_eval_device(args)
+    print(f"Using inference device: {describe_device(device)}")
+    if device.type == "cpu":
+        print("WARNING: CUDA is not available to this Python process; model inference will run on CPU.")
 
     # Ensure outputs directory exists
     os.makedirs("outputs", exist_ok=True)
@@ -43,6 +46,7 @@ def evaluate_all(args) -> Dict:
         index_file=args.index_file,
         n_sources=args.n_sources,
         cpu=args.cpu,
+        device=str(device),
         log_every=args.log_every,
         output="outputs/eval_sisnri.json",
     )
@@ -61,6 +65,7 @@ def evaluate_all(args) -> Dict:
         index_file=args.index_file,
         n_sources=args.n_sources,
         cpu=args.cpu,
+        device=str(device),
         log_every=args.log_every,
         output="outputs/eval_sdr.json",
     )
@@ -69,6 +74,12 @@ def evaluate_all(args) -> Dict:
     print(f"  SIR mean: {sdr_results['SIR_mean']:.2f} dB (±{sdr_results['SIR_std']:.2f})")
     print(f"  SAR mean: {sdr_results['SAR_mean']:.2f} dB (±{sdr_results['SAR_std']:.2f})")
     print(f"  Samples:  {sdr_results['num_samples']}")
+    if sdr_results.get("num_skipped_silent", 0) or sdr_results.get("num_skipped_invalid", 0):
+        print(
+            "  Skipped:  "
+            f"{sdr_results.get('num_skipped_silent', 0)} silent, "
+            f"{sdr_results.get('num_skipped_invalid', 0)} invalid"
+        )
 
     # 3. Localisation evaluation (top-50 patches, YOLOv8 GT)
     print("\n" + "=" * 60)
@@ -80,6 +91,7 @@ def evaluate_all(args) -> Dict:
         n_sources=args.n_sources,
         gt_boxes=args.gt_boxes,
         cpu=args.cpu,
+        device=str(device),
         use_yolo=args.use_yolo,
         yolo_model=args.yolo_model,
         yolo_conf=args.yolo_conf,
@@ -102,6 +114,7 @@ def evaluate_all(args) -> Dict:
             n_sources=args.n_sources,
             asr_model=args.asr_model,
             cpu=args.cpu,
+            device=str(device),
             sample_rate=args.sample_rate,
             output="outputs/eval_wer.json",
         )
@@ -128,6 +141,7 @@ def evaluate_all(args) -> Dict:
         index_file=args.index_file,
         n_sources=args.n_sources,
         cpu=args.cpu,
+        device=str(device),
         seen_categories=args.seen_categories,
         unseen_categories=args.unseen_categories,
         output="outputs/eval_zero_shot.json",
@@ -155,6 +169,8 @@ def evaluate_all(args) -> Dict:
             "SAR_mean": sdr_results["SAR_mean"],
             "SAR_std": sdr_results["SAR_std"],
             "num_samples": sdr_results["num_samples"],
+            "num_skipped_silent": sdr_results.get("num_skipped_silent", 0),
+            "num_skipped_invalid": sdr_results.get("num_skipped_invalid", 0),
         },
         "localisation": {
             "loc_acc": loc_results["loc_acc"],
@@ -185,6 +201,7 @@ def main():
     parser.add_argument("--n_sources", type=int, default=None, help="Number of sources")
     parser.add_argument("--asr_model", type=str, default="whisper", help="ASR model for WER evaluation")
     parser.add_argument("--cpu", action="store_true", help="Force CPU evaluation")
+    parser.add_argument("--device", type=str, default="auto", help="Evaluation device: auto, cuda, cuda:0, or cpu")
     parser.add_argument("--log_every", type=int, default=50, help="Log every N batches")
     parser.add_argument("--output", type=str, default="outputs/evaluation_results.json", help="Output JSON path")
     parser.add_argument("--sample_rate", type=int, default=16000, help="Original sample rate for WER resampling")

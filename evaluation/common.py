@@ -5,6 +5,35 @@ from typing import Optional, Tuple
 import torch
 
 
+def get_eval_device(args) -> torch.device:
+    """Resolve the device used for model inference during evaluation."""
+    if getattr(args, "cpu", False):
+        return torch.device("cpu")
+
+    requested = str(getattr(args, "device", "auto") or "auto").lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Requested device '{requested}', but torch.cuda.is_available() is False. "
+                "Check that the Lightning studio/runtime has a GPU attached."
+            )
+        return torch.device(requested)
+    return torch.device(requested)
+
+
+def describe_device(device: torch.device) -> str:
+    """Human-readable device description for evaluation logs."""
+    if device.type == "cuda":
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        name = torch.cuda.get_device_name(index)
+        return f"{device} ({name})"
+    return str(device)
+
+
 def maybe_to_device(value, device: torch.device):
     """Move tensor-like optional batch values to the evaluation device."""
     return value.to(device) if torch.is_tensor(value) else value
@@ -110,3 +139,11 @@ def stable_si_snr(
     if not torch.isfinite(si_snr):
         return torch.tensor(floor_db, device=device)
     return torch.clamp(si_snr, min=floor_db)
+
+
+def non_silent_source_mask(waveforms: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Return a boolean mask for non-silent source waveforms shaped [N, L]."""
+    if waveforms.dim() != 2:
+        raise ValueError(f"Expected waveforms with shape [N, L], got {tuple(waveforms.shape)}.")
+    clean = torch.nan_to_num(waveforms.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    return clean.pow(2).sum(dim=-1) > eps

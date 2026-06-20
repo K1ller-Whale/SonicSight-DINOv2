@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
-from evaluation.common import maybe_to_device, resolve_n_sources
+from evaluation.common import get_eval_device, maybe_to_device, resolve_n_sources
 
 
 def compute_iou(pred_box: Tuple[float, float, float, float],
@@ -182,7 +182,7 @@ def get_yolo_boxes(detector, frame: np.ndarray, conf_threshold: float = 0.5) -> 
 
 def evaluate_localisation(args) -> Dict:
     """Evaluate attention-based source localisation with top-50 patches and YOLOv8 GT."""
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = get_eval_device(args)
 
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
@@ -278,6 +278,7 @@ def main():
     parser.add_argument("--gt_boxes", type=str, default=None,
                         help="Path to ground-truth bounding boxes JSON")
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--device", type=str, default="auto", help="Evaluation device: auto, cuda, cuda:0, or cpu")
     parser.add_argument("--use_yolo", action="store_true",
                         help="Use YOLOv8 to generate GT boxes if JSON not provided")
     parser.add_argument("--yolo_model", type=str, default="yolov8n.pt",

@@ -31,6 +31,7 @@ from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
 from evaluation.common import (
     align_metric_waveforms,
+    get_eval_device,
     maybe_to_device,
     resolve_n_sources,
     stable_si_snr,
@@ -130,7 +131,7 @@ def reconstruct_mixture(mixture_stft: torch.Tensor,
 
 def evaluate_sisnri(args) -> Dict:
     """Evaluate SI-SNRi with PIT on the test split."""
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = get_eval_device(args)
 
     # Load model
     print(f"Loading checkpoint from {args.checkpoint} ...")
@@ -206,6 +207,7 @@ def main():
     parser.add_argument("--index_file", type=str, default="cache/index.json", help="Dataset index")
     parser.add_argument("--n_sources", type=int, default=None, help="Number of sources")
     parser.add_argument("--cpu", action="store_true", help="Force CPU")
+    parser.add_argument("--device", type=str, default="auto", help="Evaluation device: auto, cuda, cuda:0, or cpu")
     parser.add_argument("--log_every", type=int, default=50, help="Log every N batches")
     parser.add_argument("--output", type=str, default="outputs/eval_sisnri.json", help="Output JSON path")
     args = parser.parse_args()

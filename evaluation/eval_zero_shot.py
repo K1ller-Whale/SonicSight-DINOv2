@@ -33,6 +33,7 @@ from src.data.datamodule import AudioVisualDataModule
 from src.audio.spectrogram import ISTFTModule
 from evaluation.common import (
     align_metric_waveforms,
+    get_eval_device,
     maybe_to_device,
     resolve_n_sources,
     stable_si_snr,
@@ -120,7 +121,7 @@ def reconstruct_mixture(mixture_stft: torch.Tensor,
 
 def evaluate_category(args, category_split: str, clip_ids: List[str]) -> float:
     """Evaluate SI-SNRi on a specific category split."""
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = get_eval_device(args)
 
     model = SeparatorModule.load_from_checkpoint(args.checkpoint)
     model = model.to(device)
@@ -253,6 +254,7 @@ def main():
     parser.add_argument("--index_file", type=str, default="cache/index.json")
     parser.add_argument("--n_sources", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--device", type=str, default="auto", help="Evaluation device: auto, cuda, cuda:0, or cpu")
     parser.add_argument("--seen_categories", type=str,
                         default="speech,music_instrument",
                         help="Comma-separated list of seen categories")
