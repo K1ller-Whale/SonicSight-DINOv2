@@ -143,6 +143,7 @@ def main(cfg: DictConfig) -> None:
         include_visual=include_visual,
         seed=cfg.data.get("seed", 42),
         curriculum_schedule=curriculum_schedule if curriculum_schedule else None,
+        allow_same_category=cfg.data.get("allow_same_category", False),
     )
     trainer_cfg = cfg.get("trainer", {})
     datamodule.setup(stage="fit")

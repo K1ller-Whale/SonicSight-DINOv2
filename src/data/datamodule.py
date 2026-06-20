@@ -23,7 +23,8 @@ class AudioVisualDataModule(pl.LightningDataModule):
                  batch_size: int = 32, val_batch_size: int = 16,
                  num_workers: int = 4, include_visual: bool = True,
                  seed: int = 42,
-                 curriculum_schedule: Optional[List[Tuple[int, int]]] = None):
+                 curriculum_schedule: Optional[List[Tuple[int, int]]] = None,
+                 allow_same_category: bool = False):
         super().__init__()
         self.save_hyperparameters()
         self.index_file = index_file
@@ -33,6 +34,7 @@ class AudioVisualDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.include_visual = include_visual
         self.seed = seed
+        self.allow_same_category = allow_same_category
         # Curriculum: list of (step_threshold, n_sources)
         # Default to no-op schedule: stay at current n_sources
         self.curriculum_schedule = curriculum_schedule or [
@@ -68,15 +70,18 @@ class AudioVisualDataModule(pl.LightningDataModule):
             self.train_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="train", include_visual=self.include_visual,
+                allow_same_category=self.allow_same_category,
             )
             self.val_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="val", include_visual=self.include_visual,
+                allow_same_category=self.allow_same_category,
             )
         if stage == "test" or stage is None:
             self.test_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="test", include_visual=self.include_visual,
+                allow_same_category=self.allow_same_category,
             )
 
     def train_dataloader(self) -> DataLoader:

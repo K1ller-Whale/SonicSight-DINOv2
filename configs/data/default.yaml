@@ -24,3 +24,6 @@ data:
   index_file: null
   num_workers: 4
   seed: 42
+  # If true, mix clips from the same category (intra-category mixing).
+  # If false (default), force mixing from different categories (cross-category).
+  allow_same_category: false

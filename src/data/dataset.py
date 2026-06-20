@@ -48,6 +48,11 @@ class MixAndSepareDataset(Dataset):
         Whether to load DINOv2 visual features (``False`` for Phase 1).
     device :
         Torch device on which to place loaded tensors.
+    allow_same_category :
+        If ``True``, sources are mixed from *within* the same category
+        (intra-category mixing).  If ``False`` (default), sources are
+        forced to come from *different* categories (cross-category mixing),
+        which is the original behaviour.
     """
 
     def __init__(
@@ -58,6 +63,7 @@ class MixAndSepareDataset(Dataset):
         cache_dir: Optional[str] = None,
         include_visual: bool = True,
         device: str = "cpu",
+        allow_same_category: bool = False,
     ):
         super().__init__()
         self.index_file = index_file
@@ -65,6 +71,7 @@ class MixAndSepareDataset(Dataset):
         self.split = split
         self.include_visual = include_visual
         self.device = torch.device(device)
+        self.allow_same_category = allow_same_category
 
         with open(index_file, "r") as f:
             self._all_meta = json.load(f)
@@ -85,11 +92,28 @@ class MixAndSepareDataset(Dataset):
             category = self.clip_categories[cid]
             self.category_to_clips.setdefault(category, []).append(cid)
         self.categories = sorted(self.category_to_clips)
-        if len(self.categories) < self.n_sources:
-            raise ValueError(
-                f"Need at least {self.n_sources} distinct categories for split "
-                f"'{split}', found {len(self.categories)}"
-            )
+
+        if self.allow_same_category:
+            # Validate: at least one category has enough clips for mixing
+            max_clips_in_cat = max(len(v) for v in self.category_to_clips.values())
+            if max_clips_in_cat < self.n_sources:
+                raise ValueError(
+                    f"allow_same_category=True requires at least one category "
+                    f"with {self.n_sources} clips for split '{split}', "
+                    f"but the largest category only has {max_clips_in_cat} clips"
+                )
+            # Pre-filter to categories that have enough clips
+            self._eligible_categories = [
+                cat for cat, clips in self.category_to_clips.items()
+                if len(clips) >= self.n_sources
+            ]
+        else:
+            if len(self.categories) < self.n_sources:
+                raise ValueError(
+                    f"Need at least {self.n_sources} distinct categories for split "
+                    f"'{split}', found {len(self.categories)}"
+                )
+            self._eligible_categories = self.categories
 
         self.cache_dir = cache_dir or os.path.dirname(index_file)
         self._stft = STFTModule()
@@ -202,7 +226,34 @@ class MixAndSepareDataset(Dataset):
 
         return clip_id.strip().lower().split("_")[0]
 
+    # ------------------------------------------------------------------ #
+    # Sampling strategies
+    # ------------------------------------------------------------------ #
+
+    def _sample_clip_ids(self, idx: int) -> List[str]:
+        """Sample clip IDs for mixing, respecting the allow_same_category flag."""
+        if self.allow_same_category:
+            return self._sample_same_category_clip_ids(idx)
+        return self._sample_cross_category_clip_ids(idx)
+
+    def _sample_same_category_clip_ids(self, idx: int) -> List[str]:
+        """Sample N distinct clips from the same category."""
+        if self.split == "train":
+            category = random.choice(self._eligible_categories)
+            return random.sample(self.category_to_clips[category], self.n_sources)
+
+        # Deterministic for val/test
+        cat_idx = idx % len(self._eligible_categories)
+        category = self._eligible_categories[cat_idx]
+        pool = self.category_to_clips[category]
+        clip_cycle = idx // len(self._eligible_categories)
+        return [
+            pool[(clip_cycle + i) % len(pool)]
+            for i in range(self.n_sources)
+        ]
+
     def _sample_cross_category_clip_ids(self, idx: int) -> List[str]:
+        """Sample one clip from each of N distinct categories."""
         if len(self.categories) < self.n_sources:
             raise ValueError(
                 f"Need at least {self.n_sources} distinct categories, "
@@ -241,12 +292,13 @@ class MixAndSepareDataset(Dataset):
             raise ValueError(
                 f"Not enough clips ({len(self.clips)}) for n_sources={self.n_sources}"
             )
-        clip_ids = self._sample_cross_category_clip_ids(idx)
+        clip_ids = self._sample_clip_ids(idx)
         source_categories = [self.clip_categories[clip_id] for clip_id in clip_ids]
-        if len(set(source_categories)) != len(source_categories):
-            raise RuntimeError(
-                f"Cross-category sampling failed: {source_categories}"
-            )
+        if not self.allow_same_category:
+            if len(set(source_categories)) != len(source_categories):
+                raise RuntimeError(
+                    f"Cross-category sampling failed: {source_categories}"
+                )
 
         # Load waveforms per source
         source_waves = []
