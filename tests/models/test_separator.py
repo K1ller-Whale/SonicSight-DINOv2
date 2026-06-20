@@ -53,15 +53,18 @@ def batch_phase1():
 
 @pytest.fixture
 def batch_phase2():
-    """Phase 2 batch: with video."""
+    """Phase 2 batch: with cached visual features."""
     B, N_sources = 1, 2  # Reduced batch to 1 for GPU memory
     F, T = 257, 601
     L = 96000
-    N_frames = 8  # Reduced from 150 for GPU memory in test
+    N_frames = 150
+    N_patches = 16
     device = torch.device("cpu")
     return {
         "mixture_stft": torch.randn(B, 2, F, T, device=device),
-        "video_frames": torch.randn(B, N_frames, 3, 448, 448, device=device),
+        "visual_features": torch.randn(
+            B, N_sources, N_frames, N_patches, 768, device=device
+        ),
         "target_waveforms": torch.randn(B, N_sources, L, device=device),
     }
 
@@ -81,13 +84,13 @@ class TestSeparatorModuleForward:
         assert output.shape[1] == cfg["model"]["n_sources"]  # sources
         assert output.ndim == 3  # [B, N, L]
 
-    def test_forward_phase2_with_video(self, cfg, batch_phase2):
-        """Phase 2: with video forward pass."""
+    def test_forward_phase2_with_visual_features(self, cfg, batch_phase2):
+        """Phase 2: with visual feature forward pass."""
         model = SeparatorModule(cfg, phase="phase2")
         mixture_stft = batch_phase2["mixture_stft"]
-        video_frames = batch_phase2["video_frames"]
+        visual_features = batch_phase2["visual_features"]
 
-        output = model(mixture_stft, video_frames=video_frames)
+        output = model(mixture_stft, visual_features=visual_features)
 
         assert output.shape[0] == 1  # batch_phase2 has B=1
         assert output.shape[1] == cfg["model"]["n_sources"]
@@ -246,7 +249,7 @@ class TestPerSourceAttention:
         model = SeparatorModule(cfg, phase="phase2")
         model.eval()
         B, N = 2, 2
-        T, P, D_vis = 150, 1024, 768
+        T, P, D_vis = 150, 16, 768
         mixture_stft = torch.randn(B, 2, 257, 601)
 
         visual_features_5d = torch.randn(B, N, T, P, D_vis)
@@ -273,7 +276,7 @@ class TestPerSourceAttention:
         model = SeparatorModule(cfg, phase="phase2")
         model.eval()
         B, N = 2, 2
-        T, P, D_vis = 150, 1024, 768
+        T, P, D_vis = 150, 16, 768
         mixture_stft = torch.randn(B, 2, 257, 601)
         visual_features = torch.randn(B, N, T, P, D_vis)
         
@@ -298,7 +301,7 @@ class TestPerSourceAttention:
 
     def test_n_sources_2_3_4(self, cfg):
         """Per-source attention works for N=2,3,4 sources."""
-        B, T, P, D = 1, 150, 1024, 768
+        B, T, P, D = 1, 150, 16, 768
         mixture_stft = torch.randn(B, 2, 257, 601)
 
         for n_src in [2, 3, 4]:

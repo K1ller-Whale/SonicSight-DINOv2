@@ -2,8 +2,10 @@
 import json
 
 import pytest
+import torch
 
 from src.data.dataset import MixAndSepareDataset
+from src.data.preprocessing import CLIP_LENGTH, N_VIDEO_FRAMES
 
 
 def _write_index(tmp_path, entries):
@@ -139,4 +141,50 @@ def test_same_category_sampler_requires_enough_clips(tmp_path):
             split="train",
             include_visual=False,
             allow_same_category=True,
+        )
+
+
+def test_visual_features_use_each_selected_clips_first_visual_path(tmp_path):
+    """Each synthetic source should use its selected clip's visual anchor."""
+    audio_a = tmp_path / "a.pt"
+    audio_b = tmp_path / "b.pt"
+    visual_a = tmp_path / "a_visual.pt"
+    visual_b = tmp_path / "b_visual.pt"
+    torch.save(torch.zeros(CLIP_LENGTH), audio_a)
+    torch.save(torch.ones(CLIP_LENGTH), audio_b)
+    torch.save(torch.ones(N_VIDEO_FRAMES, 2, 4), visual_a)
+    torch.save(torch.full((N_VIDEO_FRAMES, 2, 4), 2.0), visual_b)
+
+    entries = {
+        "violin_a": {
+            "split": "val",
+            "category": "violin",
+            "source_paths": [str(audio_a)],
+            "visual_paths": [str(visual_a)],
+        },
+        "piano_a": {
+            "split": "val",
+            "category": "piano",
+            "source_paths": [str(audio_b)],
+            "visual_paths": [str(visual_b)],
+        },
+    }
+    dataset = MixAndSepareDataset(
+        _write_index(tmp_path, entries),
+        n_sources=2,
+        split="val",
+        include_visual=True,
+    )
+
+    sample = dataset[0]
+
+    assert sample["visual_features"].shape == (2, N_VIDEO_FRAMES, 2, 4)
+    expected_by_clip = {
+        "violin_a": torch.ones(N_VIDEO_FRAMES, 2, 4),
+        "piano_a": torch.full((N_VIDEO_FRAMES, 2, 4), 2.0),
+    }
+    for source_idx, clip_id in enumerate(sample["clip_ids"]):
+        torch.testing.assert_close(
+            sample["visual_features"][source_idx],
+            expected_by_clip[clip_id],
         )

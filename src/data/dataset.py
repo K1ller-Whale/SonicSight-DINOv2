@@ -5,9 +5,11 @@ SPEC 11.2, 7.1: Synthetic mixtures from clean (source, video) pairs.
 import json
 import os
 import random
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
@@ -20,6 +22,7 @@ from src.data.preprocessing import (
     N_VIDEO_FRAMES,
     N_STFT_FRAMES,
     CLIP_LENGTH,
+    IMAGE_SIZE,
 )
 
 
@@ -135,6 +138,52 @@ class MixAndSepareDataset(Dataset):
         if wave.dim() == 2:
             wave = wave.squeeze(0)
         return wave.float()
+
+    @staticmethod
+    def _load_frames_from_mp4(path: str) -> torch.Tensor:
+        """Load a 6-second mp4 visual clip as [T, 3, H, W] uint8 frames."""
+        cmd = [
+            "ffmpeg",
+            "-i",
+            path,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+            "-loglevel",
+            "error",
+        ]
+        result = subprocess.run(cmd, capture_output=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed while reading visual clip: {path}")
+
+        frame_bytes = IMAGE_SIZE * IMAGE_SIZE * 3
+        n_frames = len(result.stdout) // frame_bytes
+        if n_frames == 0:
+            raise RuntimeError(f"No frames decoded from visual clip: {path}")
+
+        raw = result.stdout[: n_frames * frame_bytes]
+        frames = np.frombuffer(raw, dtype=np.uint8).reshape(
+            n_frames, IMAGE_SIZE, IMAGE_SIZE, 3
+        )
+        if n_frames < N_VIDEO_FRAMES:
+            pad = np.zeros(
+                (N_VIDEO_FRAMES - n_frames, IMAGE_SIZE, IMAGE_SIZE, 3),
+                dtype=np.uint8,
+            )
+            frames = np.concatenate([frames, pad], axis=0)
+        else:
+            frames = frames[:N_VIDEO_FRAMES]
+
+        return torch.from_numpy(frames.copy()).permute(0, 3, 1, 2)
+
+    @classmethod
+    def _load_visual_tensor(cls, path: str) -> torch.Tensor:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+            return cls._load_frames_from_mp4(path)
+        return torch.load(path, weights_only=False)
 
     @staticmethod
     def _pad_waveforms(waves: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -342,33 +391,50 @@ class MixAndSepareDataset(Dataset):
         # Visual features - load per source separately (no averaging)
         if self.include_visual:
             visual_list = []
-            for src_idx, clip_id in enumerate(clip_ids):
+            missing_visuals = []
+            for clip_id in clip_ids:
                 visual_paths = self._all_meta[clip_id].get("visual_paths", [])
-                if visual_paths and src_idx < len(visual_paths):
-                    vpath = visual_paths[src_idx]
+                if visual_paths:
+                    # Each selected clip contributes its own first source/audio.
+                    # Therefore its own first visual path is the matching visual anchor.
+                    vpath = visual_paths[0]
                     if vpath and os.path.exists(vpath):
-                        vf = torch.load(vpath, weights_only=False)
+                        vf = self._load_visual_tensor(vpath)
                     else:
+                        missing_visuals.append(clip_id)
                         vf = None
                 else:
+                    missing_visuals.append(clip_id)
                     vf = None
                 visual_list.append(vf)
 
-            if any(v is not None for v in visual_list):
-                # Temporal alignment: STFT frame t -> video frame floor(t * 150 / 601)
-                # Precompute alignment table once
-                align = [int(t * N_VIDEO_FRAMES / N_STFT_FRAMES) for t in range(N_STFT_FRAMES)]
+            if missing_visuals:
+                raise RuntimeError(
+                    "Missing visual data for include_visual=True clips: "
+                    + ", ".join(missing_visuals)
+                )
 
-                aligned = []
+            first = visual_list[0]
+            if first.dim() == 4 and first.shape[1] == 3:
+                # Raw frames from dataset_man.py Mode B mp4 clips:
+                # [N_sources, 150, 3, 448, 448].
+                output["video_frames"] = torch.stack(visual_list)
+            else:
+                # Precomputed DINOv2 tokens: [V, 1024, 768] per selected clip.
+                # Keep video-time length here; the model aligns video frames to
+                # audio bottleneck positions.
+                features = []
                 for v in visual_list:
-                    if v is not None:
-                        # v: [V_src, 1024, 768] -> lookup each STFT frame's video frame
-                        v_aligned = v[align]  # [601, 1024, 768]
-                    else:
-                        v_aligned = torch.zeros(N_STFT_FRAMES, 1024, 768)
-                    aligned.append(v_aligned)
-                # Stack as [N_sources, T, 1024, 768] - no averaging!
-                output["visual_features"] = torch.stack(aligned)  # [N, T, 1024, 768]
+                    if v.shape[0] < N_VIDEO_FRAMES:
+                        pad = torch.zeros(
+                            N_VIDEO_FRAMES - v.shape[0],
+                            *v.shape[1:],
+                            dtype=v.dtype,
+                        )
+                        v = torch.cat([v, pad], dim=0)
+                    features.append(v[:N_VIDEO_FRAMES])
+                # Stack as [N_sources, 150, 1024, 768] - no averaging.
+                output["visual_features"] = torch.stack(features)
 
         # CRM targets
         if self.split == "train":

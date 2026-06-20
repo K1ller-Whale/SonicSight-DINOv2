@@ -84,6 +84,34 @@ def _derive_max_epochs(max_steps: int, batches_per_epoch: int, accumulate_grad_b
     return max(1, math.ceil(max_steps / optimizer_steps_per_epoch))
 
 
+def _checkpoint_phase(checkpoint_path: str) -> str | None:
+    """Best-effort read of the phase stored in a Lightning checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    hyper = checkpoint.get("hyper_parameters", {})
+    phase = hyper.get("phase")
+    if phase:
+        return str(phase)
+    cfg = hyper.get("cfg", {})
+    if isinstance(cfg, dict):
+        train_cfg = cfg.get("train", {})
+        if isinstance(train_cfg, dict) and train_cfg.get("phase"):
+            return str(train_cfg["phase"])
+    return None
+
+
+def _load_model_weights_only(model: pl.LightningModule, checkpoint_path: str) -> None:
+    """Load model parameters without restoring optimizer, scheduler, or global step."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if "state_dict" not in checkpoint:
+        raise KeyError(f"Checkpoint has no state_dict: {checkpoint_path}")
+    incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    if incompatible.missing_keys:
+        print(f"Weights-only load missing keys: {len(incompatible.missing_keys)}")
+    if incompatible.unexpected_keys:
+        print(f"Weights-only load unexpected keys: {len(incompatible.unexpected_keys)}")
+    print(f"Loaded model weights from: {checkpoint_path}")
+
+
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     print("=" * 60)
@@ -114,6 +142,29 @@ def main(cfg: DictConfig) -> None:
         cfg=OmegaConf.to_container(cfg, resolve=True),
         phase=phase,
     )
+
+    # Phase transitions need model weights only. A full Lightning resume would
+    # restore the old phase optimizer/scheduler/global_step and can skip Phase 2.
+    resume_ckpt = cfg.train.get("resume_from_checkpoint")
+    trainer_ckpt_path = resume_ckpt if resume_ckpt else None
+    if resume_ckpt:
+        if not os.path.exists(resume_ckpt):
+            raise FileNotFoundError(f"Checkpoint not found: {resume_ckpt}")
+        ckpt_phase = _checkpoint_phase(resume_ckpt)
+        load_weights_only = cfg.train.get("load_weights_only")
+        if load_weights_only is None:
+            load_weights_only = ckpt_phase is not None and ckpt_phase != phase
+
+        if load_weights_only:
+            print(
+                "Checkpoint phase transition detected: "
+                f"{ckpt_phase or 'unknown'} -> {phase}. "
+                "Loading model weights only."
+            )
+            _load_model_weights_only(model, resume_ckpt)
+            trainer_ckpt_path = None
+        else:
+            print(f"Resuming full trainer state from: {resume_ckpt}")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -245,9 +296,6 @@ def main(cfg: DictConfig) -> None:
     if precision:
         trainer_args["precision"] = precision
 
-    # Resume from checkpoint (passed to trainer.fit, not Trainer constructor)
-    resume_ckpt = cfg.train.get("resume_from_checkpoint")
-
     trainer = pl.Trainer(**trainer_args)
 
     # ------------------------------------------------------------------ #
@@ -257,7 +305,7 @@ def main(cfg: DictConfig) -> None:
     print("Starting training...")
     print("=" * 60)
     trainer.fit(
-        model, datamodule=datamodule, ckpt_path=resume_ckpt if resume_ckpt else None
+        model, datamodule=datamodule, ckpt_path=trainer_ckpt_path
     )
 
     print("\n" + "=" * 60)

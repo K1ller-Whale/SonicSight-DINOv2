@@ -81,9 +81,19 @@ class SeparatorModule(pl.LightningModule):
         w_to_frame = [int(w * 150 / 19) for w in range(19)]
         bottleneck_frame_idx = torch.tensor([w_to_frame[i % 19] for i in range(171)], dtype=torch.long)
         self.register_buffer("bottleneck_frame_idx", bottleneck_frame_idx)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("_imagenet_mean", mean, persistent=False)
+        self.register_buffer("_imagenet_std", std, persistent=False)
         
         # Source query tokens: allocate MAX sources upfront for visual phases.
         self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
+        self.dinov2_batch_size = int(
+            cfg.get("train", {}).get(
+                "dinov2_batch_size",
+                cfg.get("model", {}).get("visual", {}).get("dinov2_batch_size", 4),
+            )
+        )
         # iSTFT for waveform reconstruction
         data_cfg = cfg.get("data", {})
         sr = data_cfg.get("sample_rate", 16000)
@@ -232,6 +242,61 @@ class SeparatorModule(pl.LightningModule):
 
         return torch.stack(source_outputs, dim=1)
 
+    def _normalize_video_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """Convert raw RGB frames to ImageNet-normalized DINOv2 input."""
+        frames = frames.to(device=self._imagenet_mean.device)
+        if not frames.is_floating_point():
+            frames = frames.float().div(255.0)
+        else:
+            frames = frames.float()
+            if frames.detach().amax() > 2.0:
+                frames = frames.div(255.0)
+        if frames.detach().amin() >= 0.0:
+            frames = (frames - self._imagenet_mean) / self._imagenet_std
+        return frames
+
+    def _video_frames_to_visual_features(self, video_frames: torch.Tensor) -> torch.Tensor:
+        """Run frozen/optionally-trainable DINOv2 over raw per-source frames.
+
+        Args:
+            video_frames: [B, N, T, 3, 448, 448] or [B, T, 3, 448, 448]
+        Returns:
+            visual_features: [B, N, T, 1024, 768]
+        """
+        if video_frames.dim() == 5:
+            video_frames = video_frames.unsqueeze(1).expand(
+                -1, self.n_sources, -1, -1, -1, -1
+            )
+        if video_frames.dim() != 6:
+            raise ValueError(
+                "video_frames must be [B,N,T,3,H,W] or [B,T,3,H,W], "
+                f"got {tuple(video_frames.shape)}"
+            )
+
+        B, N, T, C, H, W = video_frames.shape
+        if C != 3:
+            raise ValueError(f"video_frames channel dimension must be 3, got {C}")
+
+        grad_enabled = any(p.requires_grad for p in self.dinov2.parameters())
+        feature_sources = []
+        for n in range(N):
+            flat_frames = rearrange(video_frames[:, n], "B T C H W -> (B T) C H W")
+            chunks = []
+            context = torch.enable_grad() if grad_enabled else torch.no_grad()
+            with context:
+                for chunk in flat_frames.split(max(1, self.dinov2_batch_size)):
+                    chunk = self._normalize_video_frames(chunk)
+                    chunks.append(self.dinov2(chunk))
+            source_features = torch.cat(chunks, dim=0)
+            source_features = rearrange(
+                source_features,
+                "(B T) P D -> B T P D",
+                B=B,
+                T=T,
+            )
+            feature_sources.append(source_features)
+        return torch.stack(feature_sources, dim=1)
+
     def forward(self, mixture_stft: torch.Tensor,
                 video_frames: Optional[torch.Tensor] = None,
                 visual_features: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -243,8 +308,31 @@ class SeparatorModule(pl.LightningModule):
         Returns:
             separated_waveforms: [B, N_sources, L]
         """
-        if self.phase == "phase1" or visual_features is None:
+        if self.phase == "phase1":
             return self.phase1_forward(mixture_stft)
+
+        if visual_features is None:
+            if video_frames is None:
+                raise RuntimeError(
+                    "Phase 2/3 requires visual_features or video_frames. "
+                    "Check that the dataset cache was created with visuals."
+                )
+            visual_features = self._video_frames_to_visual_features(video_frames)
+
+        if visual_features.dim() == 4:
+            visual_features = visual_features.unsqueeze(1).expand(
+                -1, self.n_sources, -1, -1, -1
+            )
+        if visual_features.dim() != 5:
+            raise ValueError(
+                "visual_features must be [B,N,T,1024,768] or [B,T,1024,768], "
+                f"got {tuple(visual_features.shape)}"
+            )
+        if visual_features.shape[1] < self.n_sources:
+            raise ValueError(
+                f"Need at least {self.n_sources} visual sources, "
+                f"got {visual_features.shape[1]}"
+            )
 
         B = mixture_stft.shape[0]
         target_shape = mixture_stft.shape[-2:]  # [F, T]
@@ -365,7 +453,10 @@ class SeparatorModule(pl.LightningModule):
             si_snr_loss = torch.stack(si_snr_losses).mean()
             si_snr_db = -si_snr_loss
             entropy_loss = self._compute_attention_entropy()
-            total_loss = si_snr_loss + 0.1 * entropy_loss
+            entropy_weight = self.cfg.get("train", {}).get("loss", {}).get(
+                "attention_entropy_weight", 0.1
+            )
+            total_loss = si_snr_loss + entropy_weight * entropy_loss
             self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
             self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
             self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)

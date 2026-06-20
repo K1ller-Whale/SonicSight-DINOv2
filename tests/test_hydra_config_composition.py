@@ -18,6 +18,7 @@ def _compose(*overrides):
         "phase1",
         "phase1_kaggle",
         "phase2",
+        "phase2_kaggle",
         "phase3",
         "phase3_config_a",
         "phase3_config_b",
@@ -41,9 +42,22 @@ def test_phase1_kaggle_config_has_expected_paths_and_phase():
 
     assert cfg.train.phase == "phase1"
     assert cfg.train.disable_visual is True
-    assert cfg.data.index_file == "/kaggle/working/cache/index.json"
-    assert cfg.data.cache_dir == "/kaggle/working/cache"
-    assert cfg.outputs.checkpoint_dir == "/kaggle/working/checkpoints"
+    assert cfg.data.index_file == "./cache/index.json"
+    assert cfg.data.cache_dir == "./cache"
+    assert cfg.outputs.checkpoint_dir == "./checkpoints"
+    assert cfg.train.val_check_interval == 2500
+    assert cfg.train.check_val_every_n_epoch is None
+
+
+def test_phase2_kaggle_config_has_expected_paths_and_phase():
+    cfg = _compose("train=phase2_kaggle")
+
+    assert cfg.train.phase == "phase2"
+    assert cfg.train.disable_visual is False
+    assert cfg.data.index_file == "./cache/index.json"
+    assert cfg.data.cache_dir == "./cache"
+    assert cfg.data.allow_same_category is False
+    assert cfg.outputs.checkpoint_dir == "./checkpoints/phase2"
     assert cfg.train.val_check_interval == 2500
     assert cfg.train.check_val_every_n_epoch is None
 
