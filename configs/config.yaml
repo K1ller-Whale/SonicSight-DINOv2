@@ -28,3 +28,4 @@ outputs:
 
 logger:
   save_dir: null
+cache_to_ram: false
