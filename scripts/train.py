@@ -182,8 +182,12 @@ def main(cfg: DictConfig) -> None:
     curriculum_schedule = []
     for item in cfg.train.get("n_sources_schedule", []):
         curriculum_schedule.append((item.step, item.n))
-
+    cache_to_ram = cfg.get("cache_to_ram", None)
+    if cache_to_ram is None:
+        cache_to_ram = cfg.data.get("cache_to_ram", False)
+    print(f"Visual feature cache_to_ram: {bool(cache_to_ram)}")
     datamodule = AudioVisualDataModule(
+        cache_to_ram=bool(cache_to_ram),
         index_file=index_file,
         n_sources=n_sources,
         batch_size=cfg.train.get("batch_size", cfg.data.get("train_batch_size", 8)),
