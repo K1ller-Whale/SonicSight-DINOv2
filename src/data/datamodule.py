@@ -24,7 +24,8 @@ class AudioVisualDataModule(pl.LightningDataModule):
                  num_workers: int = 4, include_visual: bool = True,
                  seed: int = 42,
                  curriculum_schedule: Optional[List[Tuple[int, int]]] = None,
-                 allow_same_category: bool = False):
+                 allow_same_category: bool = False,
+                 cache_to_ram: bool = False):
         super().__init__()
         self.save_hyperparameters()
         self.index_file = index_file
@@ -35,6 +36,10 @@ class AudioVisualDataModule(pl.LightningDataModule):
         self.include_visual = include_visual
         self.seed = seed
         self.allow_same_category = allow_same_category
+        # When True, MixAndSepareDataset loads the on-disk DINOv2 feature cache
+        # into RAM once (in the main process, shared copy-on-write by workers).
+        # When False, features are read from disk on every access.
+        self.cache_to_ram = cache_to_ram
         # Curriculum: list of (step_threshold, n_sources)
         # Default to no-op schedule: stay at current n_sources
         self.curriculum_schedule = curriculum_schedule or [
@@ -71,17 +76,20 @@ class AudioVisualDataModule(pl.LightningDataModule):
                 self.index_file, n_sources=self.n_sources,
                 split="train", include_visual=self.include_visual,
                 allow_same_category=self.allow_same_category,
+                cache_to_ram=self.cache_to_ram,
             )
             self.val_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="val", include_visual=self.include_visual,
                 allow_same_category=self.allow_same_category,
+                cache_to_ram=self.cache_to_ram,
             )
         if stage == "test" or stage is None:
             self.test_ds = MixAndSepareDataset(
                 self.index_file, n_sources=self.n_sources,
                 split="test", include_visual=self.include_visual,
                 allow_same_category=self.allow_same_category,
+                cache_to_ram=self.cache_to_ram,
             )
 
     def train_dataloader(self) -> DataLoader:

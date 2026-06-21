@@ -2,7 +2,6 @@
 
 SPEC 11.3, 11.4: Three-phase training with differential learning rates.
 """
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,11 +13,11 @@ from src.visual.dinov2 import DINOv2FeatureExtractor
 from src.fusion.cross_attention import CrossModalAttentionModule
 from src.loss.separation import SISNRLoss, CRMLoss, MultiScaleSTFTLoss, PerceptualLoss
 from src.loss.pit_wrapper import PITLossWrapper
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 
 class JointMaskHead(nn.Module):
-    """Joint source-competitive bottleneck mask head."""
+    """Joint, source-competitive bottleneck mask head (softmax over sources)."""
 
     def __init__(self, bottleneck_channels: int, n_sources: int):
         super().__init__()
@@ -45,13 +44,7 @@ class JointMaskHead(nn.Module):
 
 
 class SeparatorModule(pl.LightningModule):
-    """
-    Phase-aware LightningModule for audio-visual source separation.
-
-    Phase 1: audio-only (visual disabled)
-    Phase 2: cross-modal attention warmup (audio frozen, attention only)
-    Phase 3: end-to-end fine-tuning (differential learning rates)
-    """
+    """DINOv2-guided audio-visual source separator (3-phase training)."""
 
     def __init__(self, cfg: Dict[str, Any], phase: str = "phase1"):
         super().__init__()
@@ -74,18 +67,23 @@ class SeparatorModule(pl.LightningModule):
         self.visual_proj = nn.Linear(768, 512, bias=False)
         # Bottleneck projection: Conv1x1 equivalent (512 -> 512)
         self.bottleneck_proj = nn.Linear(512, 512)
-        # Temporal alignment: video frame index mapping (see dataset)
         self.cross_attn = CrossModalAttentionModule()
-        
+
         # CORRECTED TEMPORAL ALIGNMENT
+        # NOTE: kept as a registered buffer for checkpoint compatibility, but the
+        # alignment is now computed dynamically in forward() via
+        # _frame_alignment_idx() so it adapts to the number of cached video
+        # frames (19 for the compact DINOv2 cache, 150 for full features).
         w_to_frame = [int(w * 150 / 19) for w in range(19)]
-        bottleneck_frame_idx = torch.tensor([w_to_frame[i % 19] for i in range(171)], dtype=torch.long)
+        bottleneck_frame_idx = torch.tensor(
+            [w_to_frame[i % 19] for i in range(171)], dtype=torch.long
+        )
         self.register_buffer("bottleneck_frame_idx", bottleneck_frame_idx)
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         self.register_buffer("_imagenet_mean", mean, persistent=False)
         self.register_buffer("_imagenet_std", std, persistent=False)
-        
+
         # Source query tokens: allocate MAX sources upfront for visual phases.
         self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
         self.dinov2_batch_size = int(
@@ -104,8 +102,13 @@ class SeparatorModule(pl.LightningModule):
         self._cached_bottleneck = None
         self._cached_bottleneck_flat = None
         self._cached_skips = None
-        self._cached_source_features = None
+        self._cached_decoder_input = None
         self._cached_attn_weights = None
+
+        # Lazily-built map {num_frames: position->frame index tensor}, used to
+        # align the 171 bottleneck positions to whatever number of video frames
+        # is available (19 for the compact cache, 150 for the full cache).
+        self._frame_idx_cache: Dict[int, torch.Tensor] = {}
 
         # --- Losses ---
         self.si_snr = SISNRLoss()
@@ -122,7 +125,7 @@ class SeparatorModule(pl.LightningModule):
             p.requires_grad_(trainable)
 
     def _apply_phase_trainability(self) -> None:
-        """Enable gradients only for parameters used by the active phase."""
+        """Enable gradients only for the parameters used by the active phase."""
         if self.phase == "phase1":
             self._set_trainable(self.audio_unet, True)
             self._set_trainable(self.joint_mask_head, True)
@@ -149,7 +152,7 @@ class SeparatorModule(pl.LightningModule):
             self.source_queries.requires_grad_(True)
 
     def _apply_dinov2_freeze(self, cfg: Dict[str, Any]):
-        """Apply DINOv2 freezing based on config (phase3 only)."""
+        """Apply DINOv2 freezing based on config (phase3 may unfreeze top blocks)."""
         if self.phase != "phase3":
             # Phase 1 & 2: DINOv2 always frozen
             for p in self.dinov2.parameters():
@@ -165,20 +168,15 @@ class SeparatorModule(pl.LightningModule):
             for p in self.dinov2.parameters():
                 p.requires_grad = False
         else:
-            # Unfreeze last N blocks
-            # DINOv2 base has 12 blocks (encoder.layer.0 to encoder.layer.11)
-            # We need to access the underlying transformer blocks
             for p in self.dinov2.parameters():
                 p.requires_grad = False
-            # Unfreeze last N blocks
+            # Unfreeze last N transformer blocks
             if hasattr(self.dinov2, 'model') and hasattr(self.dinov2.model, 'encoder'):
-                # HF DINOv2 structure
                 blocks = self.dinov2.model.encoder.layer
                 for block in blocks[-unfrozen_blocks:]:
                     for p in block.parameters():
                         p.requires_grad = True
             elif hasattr(self.dinov2, 'transformer') and hasattr(self.dinov2.transformer, 'blocks'):
-                # Alternative structure
                 blocks = self.dinov2.transformer.blocks
                 for block in blocks[-unfrozen_blocks:]:
                     for p in block.parameters():
@@ -193,9 +191,7 @@ class SeparatorModule(pl.LightningModule):
         self._cached_attn_weights = None
 
     def _update_progressive_sources(self) -> bool:
-        """Update n_sources based on global_step.
-        Only runs in Phase 3 (progressive curriculum: 2->3->4).
-        Returns True if n_sources changed. Never replaces source_queries Parameter."""
+        """Increase n_sources at progressive thresholds (phase3 curriculum)."""
         if self.phase != "phase3":
             return False
         step = self.global_step
@@ -256,13 +252,7 @@ class SeparatorModule(pl.LightningModule):
         return frames
 
     def _video_frames_to_visual_features(self, video_frames: torch.Tensor) -> torch.Tensor:
-        """Run frozen/optionally-trainable DINOv2 over raw per-source frames.
-
-        Args:
-            video_frames: [B, N, T, 3, 448, 448] or [B, T, 3, 448, 448]
-        Returns:
-            visual_features: [B, N, T, 1024, 768]
-        """
+        """Run DINOv2 over raw frames -> [B, N, T, 1024, 768] (in-loop path)."""
         if video_frames.dim() == 5:
             video_frames = video_frames.unsqueeze(1).expand(
                 -1, self.n_sources, -1, -1, -1, -1
@@ -297,17 +287,32 @@ class SeparatorModule(pl.LightningModule):
             feature_sources.append(source_features)
         return torch.stack(feature_sources, dim=1)
 
+    def _frame_alignment_idx(self, num_frames: int, device) -> torch.Tensor:
+        """Map each of the 171 bottleneck positions to a video-frame index.
+
+        The audio bottleneck is [B, 512, 9, 19], flattened to 171 = 9*19
+        positions where column ``w = position % 19``. Each column aligns to one
+        video frame: ``frame = int(w * num_frames / 19)``. This works for the
+        full 150-frame features AND for the compact 19-frame cache (where it
+        reduces to the identity mapping ``w -> w``), so no fixed buffer is
+        needed and indices can never overflow the available frames.
+        """
+        cached = self._frame_idx_cache.get(num_frames)
+        if cached is not None:
+            return cached.to(device)
+        w_to_frame = [min(int(w * num_frames / 19), num_frames - 1) for w in range(19)]
+        idx = torch.tensor(
+            [w_to_frame[i % 19] for i in range(171)],
+            dtype=torch.long,
+            device=device,
+        )
+        self._frame_idx_cache[num_frames] = idx
+        return idx
+
     def forward(self, mixture_stft: torch.Tensor,
                 video_frames: Optional[torch.Tensor] = None,
                 visual_features: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            mixture_stft: [B, 2, F, T] - complex STFT of mixture
-            video_frames: [B, T, 3, H, W] raw RGB frames (deprecated, use visual_features)
-            visual_features: [B, N_sources, T, 1024, 768] or [B, T, 1024, 768] cached DINO features
-        Returns:
-            separated_waveforms: [B, N_sources, L]
-        """
+        """Separate sources from a mixture, guided by per-source visual features."""
         if self.phase == "phase1":
             return self.phase1_forward(mixture_stft)
 
@@ -343,9 +348,6 @@ class SeparatorModule(pl.LightningModule):
         # Clear cache at start of forward
         self._clear_cache()
 
-        # 5. Cross-modal attention
-        bottleneck_flat = None
-
         # 2. Flatten bottleneck: [B, 512, 9, 19] -> [B, 171, 512]
         bottleneck_flat = rearrange(bottleneck, "B C H W -> B (H W) C")
 
@@ -359,13 +361,17 @@ class SeparatorModule(pl.LightningModule):
                 self._cached_attn_weights.append(output[1].detach())
 
         for n in range(self.n_sources):
-            vkv_n = self.visual_proj(visual_features[:, n])  # [B, 150, 1024, 512]
-            vkv_n_aligned = vkv_n[:, self.bottleneck_frame_idx]  # [B, 171, 1024, 512]
+            vkv_n = self.visual_proj(visual_features[:, n])  # [B, V, 1024, 512]
+            # Align each of the 171 bottleneck positions to a cached video frame.
+            # Computed dynamically so it works for the full 150-frame features
+            # and the compact 19-frame cache (no index overflow either way).
+            frame_idx = self._frame_alignment_idx(vkv_n.shape[1], vkv_n.device)
+            vkv_n_aligned = vkv_n[:, frame_idx]  # [B, 171, 1024, 512]
 
             # Per-source, per-position local attention
             q = rearrange(bottleneck_flat, "B P D -> (B P) 1 D")
             kv = rearrange(vkv_n_aligned, "B P K D -> (B P) K D")
-            # For localisation, we also need to capture these weights, so need_weights=True
+            # need_weights=True so attention can be inspected for localisation.
             attended_tuple = self.cross_attn(q, kv, need_weights=True, average_attn_weights=False)
             attended = attended_tuple[0] if isinstance(attended_tuple, tuple) else attended_tuple
             attended = rearrange(attended, "(B P) 1 D -> B P D", B=B)  # [B, 171, 512]
@@ -373,15 +379,17 @@ class SeparatorModule(pl.LightningModule):
             bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
             decoder_inputs.append(bottleneck_out_n)
 
-            # Source query tokens for entropy / temporal signal
+            # Source query tokens for entropy / temporal signal.
+            # vkv_n.mean(dim=2) averages over the 1024 patches and works for any
+            # number of cached frames V (19 or 150).
             hooks = []
             for block in self.cross_attn.blocks:
                 hooks.append(block.attn.register_forward_hook(attn_hook))
 
             try:
-                vkv_n_frame = vkv_n.mean(dim=2)  # [B, 150, 512]
-                sq = self.source_queries[n:n+1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, 512]
-                sq_attended_tuple = self.cross_attn(sq, vkv_n_frame, need_weights=True, average_attn_weights=False)
+                vkv_n_frame = vkv_n.mean(dim=2)  # [B, V, 512]
+                sq = self.source_queries[n:n + 1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, 512]
+                _ = self.cross_attn(sq, vkv_n_frame, need_weights=True, average_attn_weights=False)
             finally:
                 for hook in hooks:
                     hook.remove()
@@ -400,13 +408,10 @@ class SeparatorModule(pl.LightningModule):
             src_feat = decoder_input[:, i]  # [B, 512, 9, 19]
             mask = self.audio_unet.decoder(src_feat, skips, target_shape=target_shape)
             mask = torch.tanh(mask)
-
-            # iSTFT
             separated = self.istft(mask, mixture_stft)  # [B, L]
             separated_waveforms.append(separated)
 
-        # Stack: [B, N_sources, L]
-        output = torch.stack(separated_waveforms, dim=1)
+        output = torch.stack(separated_waveforms, dim=1)  # [B, N_sources, L]
         return output
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -431,7 +436,6 @@ class SeparatorModule(pl.LightningModule):
 
         # Phase-specific loss
         if self.phase == "phase1":
-            # Phase 1: SI-SNR only, per-batch with PIT
             si_snr_losses = []
             for b in range(B):
                 loss, _, _ = self.pit_wrapper(predicted_waveforms[b], target_waveforms[b])
@@ -445,7 +449,6 @@ class SeparatorModule(pl.LightningModule):
             self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
 
         elif self.phase == "phase2":
-            # Phase 2: SI-SNR + entropy
             si_snr_losses = []
             for b in range(B):
                 loss, _, _ = self.pit_wrapper(predicted_waveforms[b], target_waveforms[b])
@@ -464,7 +467,6 @@ class SeparatorModule(pl.LightningModule):
             self.log("train/entropy_loss", entropy_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
 
         else:  # phase3
-            # Phase 3: SI-SNR + cRM (shared PIT) + STFT + Perceptual
             target_masks = batch.get("target_crm_masks")
             pred_masks = self._predict_masks(mixture_stft)
 
@@ -490,12 +492,10 @@ class SeparatorModule(pl.LightningModule):
             crm_loss = torch.stack(crm_losses).mean()
 
             # Apply PIT permutation to predictions for STFT and perceptual losses
-            # perms: [B, N] - optimal permutation for each batch element
             aligned_preds = torch.stack([
                 predicted_waveforms[b, perms[b]] for b in range(B)
             ])  # [B, N, L]
 
-            # STFT and perceptual losses on PIT-aligned predictions
             stft_loss = self.stft(aligned_preds.view(-1, aligned_preds.shape[-1]),
                                   target_waveforms.view(-1, target_waveforms.shape[-1]))
             perceptual_loss = self.perceptual(aligned_preds, target_waveforms)
@@ -518,13 +518,12 @@ class SeparatorModule(pl.LightningModule):
         B = mixture_stft.shape[0]
         target_shape = mixture_stft.shape[-2:]
 
-        # Use cached forward pass intermediates
         if (self._cached_bottleneck is None
-            or self._cached_bottleneck.shape[0] != B
-            or self._cached_skips is None
-            or not hasattr(self, '_cached_decoder_input')
-            or self._cached_decoder_input is None):
-            # Fallback: recompute if cache invalid (should not happen in normal training)
+                or self._cached_bottleneck.shape[0] != B
+                or self._cached_skips is None
+                or not hasattr(self, '_cached_decoder_input')
+                or self._cached_decoder_input is None):
+            # Fallback: recompute if cache invalid (should not happen normally)
             bottleneck, skips = self.audio_unet.encoder(mixture_stft)
             masks = self.joint_mask_head(bottleneck)
             decoder_input = torch.stack(
@@ -535,7 +534,6 @@ class SeparatorModule(pl.LightningModule):
             skips = self._cached_skips
             decoder_input = self._cached_decoder_input
 
-        # Decode per-source masks using cached decoder_input
         masks = []
         for i in range(self.n_sources):
             src_feat = decoder_input[:, i]  # [B, 512, 9, 19]
@@ -545,11 +543,7 @@ class SeparatorModule(pl.LightningModule):
         return torch.stack(masks, dim=1)
 
     def _compute_attention_entropy(self) -> torch.Tensor:
-        """Compute attention entropy for regularization.
-        Entropy = -sum(p * log(p)) over attention distribution per head.
-        High entropy = diffuse attention, low entropy = focused.
-        We encourage moderate entropy.
-        """
+        """Mean entropy of cached cross-attention weights (sparsity regularizer)."""
         if not hasattr(self, '_cached_attn_weights') or self._cached_attn_weights is None:
             return torch.tensor(0.0, device=self.device)
 
@@ -557,7 +551,6 @@ class SeparatorModule(pl.LightningModule):
         count = 0
         for attn_weights in self._cached_attn_weights:
             # attn_weights: [B, n_heads, T_q, T_kv]
-            # Compute entropy per head per query position
             p = attn_weights + 1e-8  # avoid log(0)
             p = p / p.sum(dim=-1, keepdim=True)  # normalize
             entropy = -(p * p.log()).sum(dim=-1)  # [B, n_heads, T_q]
@@ -584,14 +577,13 @@ class SeparatorModule(pl.LightningModule):
         else:
             predicted_waveforms = self(mixture_stft)
 
-        # Compute SI-SNR loss per batch element with PIT
         losses = []
         for b in range(B):
             loss, _, _ = self.pit_wrapper(predicted_waveforms[b], target_waveforms[b])
             losses.append(loss)
         si_snr_loss = torch.stack(losses).mean()
 
-        # Log as positive SI-SNR dB; val/sisnri is kept for checkpoint compatibility.
+        # Log as positive SI-SNR dB; val/sisnri kept for checkpoint compatibility.
         si_snr_db = -si_snr_loss
         self.log("val/loss_value", si_snr_loss, prog_bar=False, batch_size=B, sync_dist=True)
         self.log("val/si_snr_raw_db", si_snr_db, prog_bar=False, batch_size=B, sync_dist=True)
@@ -600,121 +592,69 @@ class SeparatorModule(pl.LightningModule):
         return si_snr_db
 
     def configure_optimizers(self):
-        """Differential learning rates per phase with schedulers (SPEC 11.4)."""
-        cfg = self.hparams.cfg
-        train_cfg = cfg.get("train", {})
-        opt_cfg = train_cfg.get("optimizer", {})
-        sched_cfg = train_cfg.get("scheduler", {})
-
-        max_steps = train_cfg.get("max_steps", 100000)
-        warmup_steps = sched_cfg.get("warmup_steps", 1000)
+        """Phase-specific optimizers with differential learning rates."""
+        train_cfg = self.cfg.get("train", {})
 
         if self.phase == "phase1":
-            lr = opt_cfg.get("lr", 1e-3)
-            trainable_params = [p for p in self.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=lr,
-                weight_decay=opt_cfg.get("weight_decay", 1e-4),
-                betas=opt_cfg.get("betas", [0.9, 0.999])
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max_steps
-            )
+            lr = train_cfg.get("lr", 1e-3)
+            params = [p for p in self.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=train_cfg.get("weight_decay", 1e-4))
+            max_steps = train_cfg.get("max_steps", 100000)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps)
             return {
                 "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                }
+                "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
             }
 
         elif self.phase == "phase2":
-            lr = opt_cfg.get("lr_fusion", 5e-4)
-            # Explicitly freeze U-Net (ARCH-06) and enable only intended params
-            for p in self.audio_unet.parameters():
-                p.requires_grad_(False)
-            for p in self.bottleneck_proj.parameters():
-                p.requires_grad_(True)
-            for p in self.cross_attn.parameters():
-                p.requires_grad_(True)
-            for p in self.visual_proj.parameters():
-                p.requires_grad_(True)
-            self.source_queries.requires_grad_(True)
+            lr_fusion = train_cfg.get("lr_fusion", 5e-4)
+            params = [p for p in self.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(params, lr=lr_fusion, weight_decay=train_cfg.get("weight_decay", 1e-4))
+            max_steps = train_cfg.get("max_steps", 50000)
+            warmup_steps = train_cfg.get("warmup_steps", 1000)
 
-            trainable_params = (
-                list(self.bottleneck_proj.parameters()) +
-                list(self.cross_attn.parameters()) +
-                list(self.visual_proj.parameters()) +
-                [self.source_queries]
-            )
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=lr,
-                weight_decay=opt_cfg.get("weight_decay", 1e-4),
-                betas=opt_cfg.get("betas", [0.9, 0.999])
-            )
-            # Linear warmup then cosine
             def lr_lambda(step):
                 if step < warmup_steps:
-                    return step / warmup_steps
-                progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
-                return 0.5 * (1 + math.cos(math.pi * progress))
+                    return step / max(1, warmup_steps)
+                progress = (step - warmup_steps) / max(1, max_steps - warmup_steps)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            # LambdaLR calls step() in constructor. Restore base lr.
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
             return {
                 "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                }
+                "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
             }
 
         else:  # phase3
-            lr_fusion = opt_cfg.get("lr_fusion", 3e-4)
-            lr_audio_enc = opt_cfg.get("lr_audio_enc", 3e-5)
-            lr_dinov2 = opt_cfg.get("lr_dinov2", 1e-5)
+            lr_fusion = train_cfg.get("lr_fusion", 3e-4)
+            lr_decoder = train_cfg.get("lr_decoder", 3e-4)
+            lr_encoder = train_cfg.get("lr_encoder", 3e-5)
+            lr_dinov2 = train_cfg.get("lr_dinov2", 1e-5)
 
+            fusion_params = (
+                list(self.bottleneck_proj.parameters())
+                + list(self.visual_proj.parameters())
+                + list(self.cross_attn.parameters())
+                + [self.source_queries]
+            )
+            decoder_params = list(self.audio_unet.decoder.parameters())
+            encoder_params = []
+            for block in self.audio_unet.encoder.blocks[-2:]:
+                encoder_params += list(block.parameters())
             dinov2_params = [p for p in self.dinov2.parameters() if p.requires_grad]
-            audio_enc_params = [p for p in self.audio_unet.encoder.blocks[-2:].parameters() if p.requires_grad]
 
             param_groups = [
-                {"params": list(self.cross_attn.parameters()) +
-                        list(self.visual_proj.parameters()) +
-                        list(self.bottleneck_proj.parameters()) +
-                        [self.source_queries], "lr": lr_fusion},
-                {"params": self.audio_unet.decoder.parameters(), "lr": lr_fusion},
-                {"params": audio_enc_params, "lr": lr_audio_enc},
-                {"params": dinov2_params, "lr": lr_dinov2},
+                {"params": [p for p in fusion_params if p.requires_grad], "lr": lr_fusion},
+                {"params": [p for p in decoder_params if p.requires_grad], "lr": lr_decoder},
+                {"params": [p for p in encoder_params if p.requires_grad], "lr": lr_encoder},
             ]
+            if dinov2_params:
+                param_groups.append({"params": dinov2_params, "lr": lr_dinov2})
 
-            optimizer = torch.optim.AdamW(
-                param_groups,
-                weight_decay=opt_cfg.get("weight_decay", 1e-4),
-                betas=opt_cfg.get("betas", [0.9, 0.999])
-            )
-
-            # Capture base LRs BEFORE LambdaLR constructor calls step()
-            base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-
-            # Linear warmup then cosine (per-param-group)
-            def lr_lambda(step):
-                if step < warmup_steps:
-                    return step / warmup_steps
-                progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
-                return 0.5 * (1 + math.cos(math.pi * progress))
-
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-            # LambdaLR calls step() in constructor. Restore base lrs per group.
-            for pg, base_lr in zip(optimizer.param_groups, base_lrs):
-                pg["lr"] = base_lr
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=train_cfg.get("weight_decay", 1e-4))
+            max_steps = train_cfg.get("max_steps", 50000)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps)
             return {
                 "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                }
+                "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
             }
