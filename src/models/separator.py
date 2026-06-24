@@ -14,7 +14,7 @@ from src.fusion.cross_attention import CrossModalAttentionModule
 from src.loss.separation import SISNRLoss, CRMLoss, MultiScaleSTFTLoss, PerceptualLoss
 from src.loss.pit_wrapper import PITLossWrapper
 from typing import Optional, Dict, Any
-
+import math
 
 class JointMaskHead(nn.Module):
     """Joint, source-competitive bottleneck mask head (softmax over sources)."""
