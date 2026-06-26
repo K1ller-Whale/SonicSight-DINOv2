@@ -2,6 +2,8 @@
 
 SPEC 11.3, 11.4: Three-phase training with differential learning rates.
 """
+
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +16,7 @@ from src.fusion.cross_attention import CrossModalAttentionModule
 from src.loss.separation import SISNRLoss, CRMLoss, MultiScaleSTFTLoss, PerceptualLoss
 from src.loss.pit_wrapper import PITLossWrapper
 from typing import Optional, Dict, Any
-import math
+
 
 class JointMaskHead(nn.Module):
     """Joint, source-competitive bottleneck mask head (softmax over sources)."""
@@ -86,6 +88,10 @@ class SeparatorModule(pl.LightningModule):
 
         # Source query tokens: allocate MAX sources upfront for visual phases.
         self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
+        # ReZero gate: visual fusion enters as a ZERO-initialized residual on
+        # top of the frozen mask-head path, so Phase-2/3 start == Phase-1 and
+        # the decoder never sees out-of-distribution input. Gate learns off 0.
+        self.fusion_gate = nn.Parameter(torch.zeros(1))
         self.dinov2_batch_size = int(
             cfg.get("train", {}).get(
                 "dinov2_batch_size",
@@ -133,6 +139,7 @@ class SeparatorModule(pl.LightningModule):
             self._set_trainable(self.visual_proj, False)
             self._set_trainable(self.cross_attn, False)
             self.source_queries.requires_grad_(False)
+            self.fusion_gate.requires_grad_(False)
         elif self.phase == "phase2":
             self._set_trainable(self.audio_unet, False)
             self._set_trainable(self.joint_mask_head, False)
@@ -140,6 +147,7 @@ class SeparatorModule(pl.LightningModule):
             self._set_trainable(self.visual_proj, True)
             self._set_trainable(self.cross_attn, True)
             self.source_queries.requires_grad_(True)
+            self.fusion_gate.requires_grad_(True)
         else:
             self._set_trainable(self.audio_unet, False)
             self._set_trainable(self.joint_mask_head, False)
@@ -150,6 +158,7 @@ class SeparatorModule(pl.LightningModule):
             self._set_trainable(self.visual_proj, True)
             self._set_trainable(self.cross_attn, True)
             self.source_queries.requires_grad_(True)
+            self.fusion_gate.requires_grad_(True)
 
     def _apply_dinov2_freeze(self, cfg: Dict[str, Any]):
         """Apply DINOv2 freezing based on config (phase3 may unfreeze top blocks)."""
@@ -171,12 +180,14 @@ class SeparatorModule(pl.LightningModule):
             for p in self.dinov2.parameters():
                 p.requires_grad = False
             # Unfreeze last N transformer blocks
-            if hasattr(self.dinov2, 'model') and hasattr(self.dinov2.model, 'encoder'):
+            if hasattr(self.dinov2, "model") and hasattr(self.dinov2.model, "encoder"):
                 blocks = self.dinov2.model.encoder.layer
                 for block in blocks[-unfrozen_blocks:]:
                     for p in block.parameters():
                         p.requires_grad = True
-            elif hasattr(self.dinov2, 'transformer') and hasattr(self.dinov2.transformer, 'blocks'):
+            elif hasattr(self.dinov2, "transformer") and hasattr(
+                self.dinov2.transformer, "blocks"
+            ):
                 blocks = self.dinov2.transformer.blocks
                 for block in blocks[-unfrozen_blocks:]:
                     for p in block.parameters():
@@ -196,7 +207,9 @@ class SeparatorModule(pl.LightningModule):
             return False
         step = self.global_step
         new_n_sources = self._progressive_sources[0]
-        for threshold, n_src in zip(self._progressive_steps, self._progressive_sources[1:]):
+        for threshold, n_src in zip(
+            self._progressive_steps, self._progressive_sources[1:]
+        ):
             if step >= threshold:
                 new_n_sources = n_src
             else:
@@ -251,7 +264,9 @@ class SeparatorModule(pl.LightningModule):
             frames = (frames - self._imagenet_mean) / self._imagenet_std
         return frames
 
-    def _video_frames_to_visual_features(self, video_frames: torch.Tensor) -> torch.Tensor:
+    def _video_frames_to_visual_features(
+        self, video_frames: torch.Tensor
+    ) -> torch.Tensor:
         """Run DINOv2 over raw frames -> [B, N, T, 1024, 768] (in-loop path)."""
         if video_frames.dim() == 5:
             video_frames = video_frames.unsqueeze(1).expand(
@@ -309,9 +324,12 @@ class SeparatorModule(pl.LightningModule):
         self._frame_idx_cache[num_frames] = idx
         return idx
 
-    def forward(self, mixture_stft: torch.Tensor,
-                video_frames: Optional[torch.Tensor] = None,
-                visual_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        mixture_stft: torch.Tensor,
+        video_frames: Optional[torch.Tensor] = None,
+        visual_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Separate sources from a mixture, guided by per-source visual features."""
         if self.phase == "phase1":
             return self.phase1_forward(mixture_stft)
@@ -353,6 +371,8 @@ class SeparatorModule(pl.LightningModule):
 
         # 3. Bottleneck projection (Conv1x1 equivalent)
         bottleneck_flat = self.bottleneck_proj(bottleneck_flat)  # [B, 171, 512]
+        # Frozen, trained source-competitive masks (the Phase-1 path).
+        masks = self.joint_mask_head(bottleneck)  # [B, N, 512, 9, 19]
         decoder_inputs = []
         self._cached_attn_weights = []
 
@@ -372,12 +392,19 @@ class SeparatorModule(pl.LightningModule):
             q = rearrange(bottleneck_flat, "B P D -> (B P) 1 D")
             kv = rearrange(vkv_n_aligned, "B P K D -> (B P) K D")
             # need_weights=True so attention can be inspected for localisation.
-            attended_tuple = self.cross_attn(q, kv, need_weights=True, average_attn_weights=False)
-            attended = attended_tuple[0] if isinstance(attended_tuple, tuple) else attended_tuple
+            attended_tuple = self.cross_attn(
+                q, kv, need_weights=True, average_attn_weights=False
+            )
+            attended = (
+                attended_tuple[0]
+                if isinstance(attended_tuple, tuple)
+                else attended_tuple
+            )
             attended = rearrange(attended, "(B P) 1 D -> B P D", B=B)  # [B, 171, 512]
 
             bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
-            decoder_inputs.append(bottleneck_out_n)
+            base_n = bottleneck * masks[:, n]  # Phase-1 masked-bottleneck base
+            decoder_inputs.append(base_n + self.fusion_gate * bottleneck_out_n)
 
             # Source query tokens for entropy / temporal signal.
             # vkv_n.mean(dim=2) averages over the 1024 patches and works for any
@@ -388,8 +415,12 @@ class SeparatorModule(pl.LightningModule):
 
             try:
                 vkv_n_frame = vkv_n.mean(dim=2)  # [B, V, 512]
-                sq = self.source_queries[n:n + 1].unsqueeze(0).expand(B, -1, -1)  # [B, 1, 512]
-                _ = self.cross_attn(sq, vkv_n_frame, need_weights=True, average_attn_weights=False)
+                sq = (
+                    self.source_queries[n : n + 1].unsqueeze(0).expand(B, -1, -1)
+                )  # [B, 1, 512]
+                _ = self.cross_attn(
+                    sq, vkv_n_frame, need_weights=True, average_attn_weights=False
+                )
             finally:
                 for hook in hooks:
                     hook.remove()
@@ -414,7 +445,9 @@ class SeparatorModule(pl.LightningModule):
         output = torch.stack(separated_waveforms, dim=1)  # [B, N_sources, L]
         return output
 
-    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
         """Training step with phase-appropriate loss."""
         self._update_progressive_sources()
 
@@ -438,33 +471,110 @@ class SeparatorModule(pl.LightningModule):
         if self.phase == "phase1":
             si_snr_losses = []
             for b in range(B):
-                loss, _, _ = self.pit_wrapper(predicted_waveforms[b], target_waveforms[b])
+                loss, _, _ = self.pit_wrapper(
+                    predicted_waveforms[b], target_waveforms[b]
+                )
                 si_snr_losses.append(loss)
             si_snr_loss = torch.stack(si_snr_losses).mean()
             si_snr_db = -si_snr_loss
             total_loss = si_snr_loss
-            self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
+            self.log(
+                "train/si_snr_loss",
+                si_snr_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/loss_value",
+                si_snr_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/si_snr_raw_db",
+                si_snr_db,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/sisnr_db",
+                si_snr_db,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=B,
+            )
 
         elif self.phase == "phase2":
             si_snr_losses = []
             for b in range(B):
-                loss, _, _ = self.pit_wrapper(predicted_waveforms[b], target_waveforms[b])
+                loss, _, _ = self.pit_wrapper(
+                    predicted_waveforms[b], target_waveforms[b]
+                )
                 si_snr_losses.append(loss)
             si_snr_loss = torch.stack(si_snr_losses).mean()
             si_snr_db = -si_snr_loss
             entropy_loss = self._compute_attention_entropy()
-            entropy_weight = self.cfg.get("train", {}).get("loss", {}).get(
-                "attention_entropy_weight", 0.1
+            entropy_weight = (
+                self.cfg.get("train", {})
+                .get("loss", {})
+                .get("attention_entropy_weight", 0.1)
             )
             total_loss = si_snr_loss + entropy_weight * entropy_loss
-            self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
-            self.log("train/entropy_loss", entropy_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            self.log(
+                "train/si_snr_loss",
+                si_snr_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/loss_value",
+                si_snr_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/si_snr_raw_db",
+                si_snr_db,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/sisnr_db",
+                si_snr_db,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=B,
+            )
+            self.log(
+                "train/entropy_loss",
+                entropy_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/fusion_gate",
+                self.fusion_gate.detach().float().mean(),
+                on_step=True,
+                on_epoch=False,
+                prog_bar=True,
+                batch_size=B,
+            )
 
         else:  # phase3
             target_masks = batch.get("target_crm_masks")
@@ -472,16 +582,20 @@ class SeparatorModule(pl.LightningModule):
 
             alpha = self.cfg.get("train", {}).get("loss", {}).get("alpha_crm", 0.1)
             beta = self.cfg.get("train", {}).get("loss", {}).get("beta_stft", 0.05)
-            gamma = self.cfg.get("train", {}).get("loss", {}).get("gamma_perceptual", 0.1)
+            gamma = (
+                self.cfg.get("train", {}).get("loss", {}).get("gamma_perceptual", 0.1)
+            )
 
             si_snr_losses = []
             crm_losses = []
             perms = []
             for b in range(B):
                 si_snr_loss, crm_loss, perm = self.pit_wrapper(
-                    predicted_waveforms[b], target_waveforms[b],
-                    pred_masks[b], target_masks[b],
-                    alpha_crm=alpha
+                    predicted_waveforms[b],
+                    target_waveforms[b],
+                    pred_masks[b],
+                    target_masks[b],
+                    alpha_crm=alpha,
                 )
                 si_snr_losses.append(si_snr_loss)
                 crm_losses.append(crm_loss)
@@ -492,25 +606,95 @@ class SeparatorModule(pl.LightningModule):
             crm_loss = torch.stack(crm_losses).mean()
 
             # Apply PIT permutation to predictions for STFT and perceptual losses
-            aligned_preds = torch.stack([
-                predicted_waveforms[b, perms[b]] for b in range(B)
-            ])  # [B, N, L]
+            aligned_preds = torch.stack(
+                [predicted_waveforms[b, perms[b]] for b in range(B)]
+            )  # [B, N, L]
 
-            stft_loss = self.stft(aligned_preds.view(-1, aligned_preds.shape[-1]),
-                                  target_waveforms.view(-1, target_waveforms.shape[-1]))
+            stft_loss = self.stft(
+                aligned_preds.view(-1, aligned_preds.shape[-1]),
+                target_waveforms.view(-1, target_waveforms.shape[-1]),
+            )
             perceptual_loss = self.perceptual(aligned_preds, target_waveforms)
 
-            total_loss = si_snr_loss + alpha * crm_loss + beta * stft_loss + gamma * perceptual_loss
-            self.log("train/si_snr_loss", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/loss_value", si_snr_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/si_snr_raw_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/sisnr_db", si_snr_db, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
-            self.log("train/crm_loss", crm_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/stft_loss", stft_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-            self.log("train/perceptual_loss", perceptual_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
+            total_loss = (
+                si_snr_loss
+                + alpha * crm_loss
+                + beta * stft_loss
+                + gamma * perceptual_loss
+            )
+            self.log(
+                "train/si_snr_loss",
+                si_snr_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/loss_value",
+                si_snr_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/si_snr_raw_db",
+                si_snr_db,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/sisnr_db",
+                si_snr_db,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                batch_size=B,
+            )
+            self.log(
+                "train/crm_loss",
+                crm_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/stft_loss",
+                stft_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
+            self.log(
+                "train/perceptual_loss",
+                perceptual_loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=B,
+            )
 
-        self.log("train/total_loss", total_loss, on_step=False, on_epoch=True, prog_bar=False, batch_size=B)
-        self.log("train/loss", total_loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=B)
+        self.log(
+            "train/total_loss",
+            total_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=B,
+        )
+        self.log(
+            "train/loss",
+            total_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=B,
+        )
         return total_loss
 
     def _predict_masks(self, mixture_stft: torch.Tensor) -> torch.Tensor:
@@ -518,11 +702,13 @@ class SeparatorModule(pl.LightningModule):
         B = mixture_stft.shape[0]
         target_shape = mixture_stft.shape[-2:]
 
-        if (self._cached_bottleneck is None
-                or self._cached_bottleneck.shape[0] != B
-                or self._cached_skips is None
-                or not hasattr(self, '_cached_decoder_input')
-                or self._cached_decoder_input is None):
+        if (
+            self._cached_bottleneck is None
+            or self._cached_bottleneck.shape[0] != B
+            or self._cached_skips is None
+            or not hasattr(self, "_cached_decoder_input")
+            or self._cached_decoder_input is None
+        ):
             # Fallback: recompute if cache invalid (should not happen normally)
             bottleneck, skips = self.audio_unet.encoder(mixture_stft)
             masks = self.joint_mask_head(bottleneck)
@@ -544,7 +730,10 @@ class SeparatorModule(pl.LightningModule):
 
     def _compute_attention_entropy(self) -> torch.Tensor:
         """Mean entropy of cached cross-attention weights (sparsity regularizer)."""
-        if not hasattr(self, '_cached_attn_weights') or self._cached_attn_weights is None:
+        if (
+            not hasattr(self, "_cached_attn_weights")
+            or self._cached_attn_weights is None
+        ):
             return torch.tensor(0.0, device=self.device)
 
         total_entropy = 0.0
@@ -557,9 +746,15 @@ class SeparatorModule(pl.LightningModule):
             total_entropy += entropy.mean()
             count += 1
 
-        return total_entropy / count if count > 0 else torch.tensor(0.0, device=self.device)
+        return (
+            total_entropy / count
+            if count > 0
+            else torch.tensor(0.0, device=self.device)
+        )
 
-    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def validation_step(
+        self, batch: Dict[str, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
         """Validation step with metrics."""
         mixture_stft = batch["mixture_stft"]
         video_frames = batch.get("video_frames")
@@ -585,8 +780,12 @@ class SeparatorModule(pl.LightningModule):
 
         # Log as positive SI-SNR dB; val/sisnri kept for checkpoint compatibility.
         si_snr_db = -si_snr_loss
-        self.log("val/loss_value", si_snr_loss, prog_bar=False, batch_size=B, sync_dist=True)
-        self.log("val/si_snr_raw_db", si_snr_db, prog_bar=False, batch_size=B, sync_dist=True)
+        self.log(
+            "val/loss_value", si_snr_loss, prog_bar=False, batch_size=B, sync_dist=True
+        )
+        self.log(
+            "val/si_snr_raw_db", si_snr_db, prog_bar=False, batch_size=B, sync_dist=True
+        )
         self.log("val/sisnri", si_snr_db, prog_bar=False, batch_size=B, sync_dist=True)
         self.log("val/sisnr_db", si_snr_db, prog_bar=True, batch_size=B, sync_dist=True)
         return si_snr_db
@@ -598,9 +797,13 @@ class SeparatorModule(pl.LightningModule):
         if self.phase == "phase1":
             lr = train_cfg.get("lr", 1e-3)
             params = [p for p in self.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=train_cfg.get("weight_decay", 1e-4))
+            optimizer = torch.optim.AdamW(
+                params, lr=lr, weight_decay=train_cfg.get("weight_decay", 1e-4)
+            )
             max_steps = train_cfg.get("max_steps", 100000)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max_steps
+            )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
@@ -609,7 +812,9 @@ class SeparatorModule(pl.LightningModule):
         elif self.phase == "phase2":
             lr_fusion = train_cfg.get("lr_fusion", 5e-4)
             params = [p for p in self.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(params, lr=lr_fusion, weight_decay=train_cfg.get("weight_decay", 1e-4))
+            optimizer = torch.optim.AdamW(
+                params, lr=lr_fusion, weight_decay=train_cfg.get("weight_decay", 1e-4)
+            )
             max_steps = train_cfg.get("max_steps", 50000)
             warmup_steps = train_cfg.get("warmup_steps", 1000)
 
@@ -644,16 +849,29 @@ class SeparatorModule(pl.LightningModule):
             dinov2_params = [p for p in self.dinov2.parameters() if p.requires_grad]
 
             param_groups = [
-                {"params": [p for p in fusion_params if p.requires_grad], "lr": lr_fusion},
-                {"params": [p for p in decoder_params if p.requires_grad], "lr": lr_decoder},
-                {"params": [p for p in encoder_params if p.requires_grad], "lr": lr_encoder},
+                {
+                    "params": [p for p in fusion_params if p.requires_grad],
+                    "lr": lr_fusion,
+                },
+                {
+                    "params": [p for p in decoder_params if p.requires_grad],
+                    "lr": lr_decoder,
+                },
+                {
+                    "params": [p for p in encoder_params if p.requires_grad],
+                    "lr": lr_encoder,
+                },
             ]
             if dinov2_params:
                 param_groups.append({"params": dinov2_params, "lr": lr_dinov2})
 
-            optimizer = torch.optim.AdamW(param_groups, weight_decay=train_cfg.get("weight_decay", 1e-4))
+            optimizer = torch.optim.AdamW(
+                param_groups, weight_decay=train_cfg.get("weight_decay", 1e-4)
+            )
             max_steps = train_cfg.get("max_steps", 50000)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_steps)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max_steps
+            )
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
