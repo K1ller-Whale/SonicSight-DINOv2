@@ -11,8 +11,13 @@ Usage:
       --index-file ./cache/index.json \
       --num-batches 8
 """
+
 import argparse
 import torch
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.models.separator import SeparatorModule
 from src.data.datamodule import AudioVisualDataModule
@@ -29,16 +34,21 @@ def sisnr_db_for_batch(model, batch, device, visual_mode="real"):
             "visuals. That alone would pin Phase 2 at the audio-only baseline."
         )
     vf = vf.to(device)
-    if visual_mode == "swap":      # mismatched vision (flip source dim)
+    if visual_mode == "swap":  # mismatched vision (flip source dim)
         vf = torch.flip(vf, dims=[1])
-    elif visual_mode == "zero":    # vision removed, fusion path still active
+    elif visual_mode == "zero":  # vision removed, fusion path still active
         vf = torch.zeros_like(vf)
-    elif visual_mode == "noise":   # random vision
+    elif visual_mode == "noise":  # random vision
         vf = torch.randn_like(vf)
     preds = model(mix, visual_features=vf)
-    B = tgt.shape[0]
-    losses = [model.pit_wrapper(preds[b], tgt[b])[0] for b in range(B)]
-    return (-torch.stack(losses).mean()).item()
+    # FIXED-ORDER (non-PIT) scoring. output[n] is conditioned on
+    # visual_features[n], which the dataset aligns with target_waveforms[n], so
+    # we must score output[n] against target[n] directly. Using PIT here (the
+    # old behavior) re-matches outputs to targets by audio similarity and would
+    # silently UNDO the swap ablation -- making swap == baseline no matter what,
+    # which is exactly the misleading result we got before this fix.
+    loss = model._fixed_order_si_snr(preds, tgt)
+    return (-loss).item()
 
 
 def run_condition(model, batches, device, gate_value=None, visual_mode="real"):
@@ -61,6 +71,17 @@ def main():
     ap.add_argument("--index-file", default="./cache/index.json")
     ap.add_argument("--num-batches", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument(
+        "--allow-same-category",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Force same-category mixing on/off for the diagnostic. If omitted, "
+            "uses the checkpoint's saved cfg value. Pass --allow-same-category "
+            "to test same-category routing, or --no-allow-same-category to "
+            "force cross-category."
+        ),
+    )
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,8 +98,10 @@ def main():
 
     model = SeparatorModule(cfg=cfg, phase="phase2")
     incompat = model.load_state_dict(ckpt["state_dict"], strict=False)
-    print(f"missing keys: {len(incompat.missing_keys)} | "
-          f"unexpected keys: {len(incompat.unexpected_keys)}")
+    print(
+        f"missing keys: {len(incompat.missing_keys)} | "
+        f"unexpected keys: {len(incompat.unexpected_keys)}"
+    )
     model.eval().to(device)
 
     gate = model.fusion_gate.detach().float().mean().item()
@@ -89,6 +112,13 @@ def main():
 
     # ---- val data ----
     n_sources = cfg.get("model", {}).get("n_sources", 2)
+    if args.allow_same_category is not None:
+        allow_same = args.allow_same_category
+        _asc_src = "CLI override (--allow-same-category)"
+    else:
+        allow_same = cfg.get("data", {}).get("allow_same_category", False)
+        _asc_src = "checkpoint cfg"
+    print(f"allow_same_category: {allow_same}  [{_asc_src}]")
     dm = AudioVisualDataModule(
         cache_to_ram=False,
         index_file=args.index_file,
@@ -99,7 +129,7 @@ def main():
         include_visual=True,
         seed=42,
         curriculum_schedule=None,
-        allow_same_category=cfg.get("data", {}).get("allow_same_category", False),
+        allow_same_category=allow_same,
     )
     dm.setup(stage="fit")
     loader = dm.val_dataloader()
@@ -118,7 +148,9 @@ def main():
         m = vf0.abs().mean().item()
         print(f"visual_features shape: {tuple(vf0.shape)}")
         print(f"per-source visual divergence |s0-s1| / |mean| = {d / (m + 1e-9):.4f}")
-        print("  (~0 => both sources get identical visuals; vision CANNOT disambiguate)\n")
+        print(
+            "  (~0 => both sources get identical visuals; vision CANNOT disambiguate)\n"
+        )
 
     # ---- attention entropy on real visuals ----
     with torch.no_grad():
@@ -128,12 +160,14 @@ def main():
     print("  (very high/flat => attention is ~uniform, not localizing)\n")
 
     # ---- the decisive ablations ----
-    base   = run_condition(model, batches, device)                       # trained gate
-    g0     = run_condition(model, batches, device, gate_value=0.0)       # == Phase 1
-    ghi    = run_condition(model, batches, device, gate_value=1.0)       # force fusion on
-    swap   = run_condition(model, batches, device, visual_mode="swap")   # mismatched vision
-    zero   = run_condition(model, batches, device, visual_mode="zero")   # vision removed
-    noise  = run_condition(model, batches, device, visual_mode="noise")  # random vision
+    base = run_condition(model, batches, device)  # trained gate
+    g0 = run_condition(model, batches, device, gate_value=0.0)  # == Phase 1
+    ghi = run_condition(model, batches, device, gate_value=1.0)  # force fusion on
+    swap = run_condition(
+        model, batches, device, visual_mode="swap"
+    )  # mismatched vision
+    zero = run_condition(model, batches, device, visual_mode="zero")  # vision removed
+    noise = run_condition(model, batches, device, visual_mode="noise")  # random vision
 
     print("-" * 64)
     print(f"{'condition':<34}{'val SI-SNR dB':>14}")
@@ -147,7 +181,9 @@ def main():
     print("-" * 64)
 
     print("\nHOW TO READ THIS:")
-    print("* baseline == gate0  -> gate ~ 0: model ignores vision (no learning signal).")
+    print(
+        "* baseline == gate0  -> gate ~ 0: model ignores vision (no learning signal)."
+    )
     print("* baseline == swap == zero -> output does not depend on vision content;")
     print("    fusion is wired but visual info is unused/uninformative.")
     print("* gate1 << gate0 (much worse) -> attended features are OOD/misaligned;")

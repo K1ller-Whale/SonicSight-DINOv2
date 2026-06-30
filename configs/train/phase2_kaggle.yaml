@@ -49,7 +49,7 @@ data:
   cache_dir: "./cache"
   num_workers: 2
   seed: 42
-  allow_same_category: false
+  allow_same_category: true
 
 trainer:
   accelerator: "auto"

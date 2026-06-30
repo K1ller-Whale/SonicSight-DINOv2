@@ -88,10 +88,16 @@ class SeparatorModule(pl.LightningModule):
 
         # Source query tokens: allocate MAX sources upfront for visual phases.
         self.source_queries = nn.Parameter(torch.randn(max_sources, 512) * 0.02)
-        # ReZero gate: visual fusion enters as a ZERO-initialized residual on
-        # top of the frozen mask-head path, so Phase-2/3 start == Phase-1 and
-        # the decoder never sees out-of-distribution input. Gate learns off 0.
-        self.fusion_gate = nn.Parameter(torch.zeros(1))
+        # ReZero-style gate on the visual modulation branch. Warm-started to a
+        # small POSITIVE value (not 0) to break the cold-start: the fusion
+        # modules (cross_attn / visual_proj) receive gradient proportional to
+        # this gate, so at gate==0 they barely learn and the gate never grows
+        # (observed: stuck at +0.005 after ~48 epoch-equivalents). A small
+        # warm-start is now SAFE because fusion is a bounded multiplicative
+        # modulation (gate=1 costs ~1 dB, not the ~-2 dB collapse of the old
+        # additive form). Tunable via cfg.model.fusion_gate_init.
+        fusion_gate_init = float(cfg.get("model", {}).get("fusion_gate_init", 0.1))
+        self.fusion_gate = nn.Parameter(torch.full((1,), fusion_gate_init))
         self.dinov2_batch_size = int(
             cfg.get("train", {}).get(
                 "dinov2_batch_size",
@@ -404,7 +410,16 @@ class SeparatorModule(pl.LightningModule):
 
             bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
             base_n = bottleneck * masks[:, n]  # Phase-1 masked-bottleneck base
-            decoder_inputs.append(base_n + self.fusion_gate * bottleneck_out_n)
+            # Visual fusion as a BOUNDED MULTIPLICATIVE modulation of the masked
+            # bottleneck. The Phase-2 decoder is FROZEN, so it can only interpret
+            # masked-bottleneck-distributed input. Additive injection of the raw
+            # attention output is out-of-distribution for the frozen decoder
+            # (gate=1 collapses to ~-2 dB), which forces the ReZero gate to stay
+            # ~0 and blocks all learning. tanh bounds the per-element correction
+            # to [-1, 1] so the decoder input stays in-distribution; at
+            # fusion_gate=0 this is exactly the Phase-1 path (base_n).
+            visual_mod = torch.tanh(bottleneck_out_n)
+            decoder_inputs.append(base_n * (1.0 + self.fusion_gate * visual_mod))
 
             # Source query tokens for entropy / temporal signal.
             # vkv_n.mean(dim=2) averages over the 1024 patches and works for any
@@ -512,13 +527,12 @@ class SeparatorModule(pl.LightningModule):
             )
 
         elif self.phase == "phase2":
-            si_snr_losses = []
-            for b in range(B):
-                loss, _, _ = self.pit_wrapper(
-                    predicted_waveforms[b], target_waveforms[b]
-                )
-                si_snr_losses.append(loss)
-            si_snr_loss = torch.stack(si_snr_losses).mean()
+            # Visual condition defines source identity -> fixed-order loss, NOT PIT.
+            # PIT would relabel outputs by audio similarity and discard the
+            # visual-to-source supervision, letting the model ignore the video.
+            si_snr_loss = self._fixed_order_si_snr(
+                predicted_waveforms, target_waveforms
+            )
             si_snr_db = -si_snr_loss
             entropy_loss = self._compute_attention_entropy()
             entropy_weight = (
@@ -586,35 +600,21 @@ class SeparatorModule(pl.LightningModule):
                 self.cfg.get("train", {}).get("loss", {}).get("gamma_perceptual", 0.1)
             )
 
-            si_snr_losses = []
-            crm_losses = []
-            perms = []
-            for b in range(B):
-                si_snr_loss, crm_loss, perm = self.pit_wrapper(
-                    predicted_waveforms[b],
-                    target_waveforms[b],
-                    pred_masks[b],
-                    target_masks[b],
-                    alpha_crm=alpha,
-                )
-                si_snr_losses.append(si_snr_loss)
-                crm_losses.append(crm_loss)
-                perms.append(perm)
-
-            si_snr_loss = torch.stack(si_snr_losses).mean()
-            si_snr_db = -si_snr_loss
-            crm_loss = torch.stack(crm_losses).mean()
-
-            # Apply PIT permutation to predictions for STFT and perceptual losses
-            aligned_preds = torch.stack(
-                [predicted_waveforms[b, perms[b]] for b in range(B)]
-            )  # [B, N, L]
-
-            stft_loss = self.stft(
-                aligned_preds.view(-1, aligned_preds.shape[-1]),
-                target_waveforms.view(-1, target_waveforms.shape[-1]),
+            # Visual condition defines source identity -> fixed-order loss, NOT PIT.
+            si_snr_loss = self._fixed_order_si_snr(
+                predicted_waveforms, target_waveforms
             )
-            perceptual_loss = self.perceptual(aligned_preds, target_waveforms)
+            si_snr_db = -si_snr_loss
+            crm_loss = torch.stack(
+                [self.crm(pred_masks[b], target_masks[b]) for b in range(B)]
+            ).mean()
+
+            # Outputs are already in target order (no permutation to apply).
+            stft_loss = self.stft(
+                predicted_waveforms.reshape(-1, predicted_waveforms.shape[-1]),
+                target_waveforms.reshape(-1, target_waveforms.shape[-1]),
+            )
+            perceptual_loss = self.perceptual(predicted_waveforms, target_waveforms)
 
             total_loss = (
                 si_snr_loss
@@ -728,6 +728,31 @@ class SeparatorModule(pl.LightningModule):
             masks.append(mask)
         return torch.stack(masks, dim=1)
 
+    def _fixed_order_si_snr(
+        self, predicted_waveforms: torch.Tensor, target_waveforms: torch.Tensor
+    ) -> torch.Tensor:
+        """Fixed-order (non-PIT) SI-SNR loss for visually-conditioned phases.
+
+        In Phase 2/3 the visual condition for source n defines which target
+        must be reconstructed: output[n] is conditioned on visual_features[n],
+        which the dataset aligns with target_waveforms[n]. Applying PIT here
+        would re-match outputs to targets by audio similarity alone and discard
+        the visual-to-source supervision, letting the model ignore the video.
+        We therefore supervise output[n] against target[n] directly.
+        """
+        B, N, _ = predicted_waveforms.shape
+        losses = []
+        for b in range(B):
+            sample_loss = -self.si_snr._si_snr(
+                predicted_waveforms[b, 0], target_waveforms[b, 0]
+            )
+            for n in range(1, N):
+                sample_loss = sample_loss - self.si_snr._si_snr(
+                    predicted_waveforms[b, n], target_waveforms[b, n]
+                )
+            losses.append(sample_loss / N)
+        return torch.stack(losses).mean()
+
     def _compute_attention_entropy(self) -> torch.Tensor:
         """Mean entropy of cached cross-attention weights (sparsity regularizer)."""
         if (
@@ -772,11 +797,19 @@ class SeparatorModule(pl.LightningModule):
         else:
             predicted_waveforms = self(mixture_stft)
 
-        losses = []
-        for b in range(B):
-            loss, _, _ = self.pit_wrapper(predicted_waveforms[b], target_waveforms[b])
-            losses.append(loss)
-        si_snr_loss = torch.stack(losses).mean()
+        # Match training supervision: PIT only in phase1, fixed-order otherwise.
+        if self.phase == "phase1":
+            losses = []
+            for b in range(B):
+                loss, _, _ = self.pit_wrapper(
+                    predicted_waveforms[b], target_waveforms[b]
+                )
+                losses.append(loss)
+            si_snr_loss = torch.stack(losses).mean()
+        else:
+            si_snr_loss = self._fixed_order_si_snr(
+                predicted_waveforms, target_waveforms
+            )
 
         # Log as positive SI-SNR dB; val/sisnri kept for checkpoint compatibility.
         si_snr_db = -si_snr_loss

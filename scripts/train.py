@@ -74,13 +74,19 @@ def _resolve_num_devices(trainer_cfg: DictConfig) -> int:
         return 1
 
 
-def _estimate_batches_per_epoch(num_samples: int, batch_size: int, num_devices: int) -> int:
+def _estimate_batches_per_epoch(
+    num_samples: int, batch_size: int, num_devices: int
+) -> int:
     per_device_samples = math.ceil(num_samples / max(1, num_devices))
     return max(1, math.ceil(per_device_samples / batch_size))
 
 
-def _derive_max_epochs(max_steps: int, batches_per_epoch: int, accumulate_grad_batches: int) -> int:
-    optimizer_steps_per_epoch = max(1, math.ceil(batches_per_epoch / accumulate_grad_batches))
+def _derive_max_epochs(
+    max_steps: int, batches_per_epoch: int, accumulate_grad_batches: int
+) -> int:
+    optimizer_steps_per_epoch = max(
+        1, math.ceil(batches_per_epoch / accumulate_grad_batches)
+    )
     return max(1, math.ceil(max_steps / optimizer_steps_per_epoch))
 
 
@@ -235,11 +241,17 @@ def main(cfg: DictConfig) -> None:
         LearningRateMonitor(logging_interval="epoch"),
         ModelCheckpoint(
             dirpath=checkpoint_dir,
-            filename=f"{{step}}-{phase}-" + "{val/sisnri:.2f}",
-            save_top_k=3,
+            # NOTE: do not put "{val/sisnri}" in the filename -- the "/" makes
+            # Lightning create a nested "...-val/" subdir (the cause of the odd
+            # "step=312-phase2-val/sisnri=-2.73.ckpt" path). Use step/epoch only;
+            # the score is still in TensorBoard and drives top-k selection below.
+            filename=f"{phase}-" + "epoch{epoch:03d}-step{step:07d}",
+            auto_insert_metric_name=False,
             monitor="val/sisnri",
             mode="max",
-            every_n_train_steps=cfg.train.get("checkpoint_every_n_steps", 5000),
+            # Save at every validation end (no every_n_train_steps, which counted
+            # OPTIMIZER steps and -- with grad-accum -- fired far rarer than val).
+            save_top_k=cfg.train.get("save_top_k", 3),  # set to -1 to keep ALL
             save_last=True,
         ),
     ]
@@ -308,9 +320,7 @@ def main(cfg: DictConfig) -> None:
     print("\n" + "=" * 60)
     print("Starting training...")
     print("=" * 60)
-    trainer.fit(
-        model, datamodule=datamodule, ckpt_path=trainer_ckpt_path
-    )
+    trainer.fit(model, datamodule=datamodule, ckpt_path=trainer_ckpt_path)
 
     print("\n" + "=" * 60)
     print("Training complete!")

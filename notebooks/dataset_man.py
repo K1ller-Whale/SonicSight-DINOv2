@@ -33,10 +33,10 @@ N_STFT_FRAMES=601, N_VIDEO_FRAMES=150, IMAGE_SIZE=448
 
 Usage
 -----
-    python preprocess_music_v2.py --mode B --workers 12 --nvenc   # Phase 2/3
-    python preprocess_music_v2.py --mode A --workers 12           # Phase 1
-    python preprocess_music_v2.py --mode B --max-clips-per-video 1 --workers 8
-    python preprocess_music_v2.py --mode B --force                # ignore cache
+    python notebooks/dataset_man.py --mode B --workers 12 --nvenc   # Phase 2/3
+    python notebooks/dataset_man.py --mode A --workers 12           # Phase 1
+    python notebooks/dataset_man.py --mode B --max-clips-per-video 1 --workers 8
+    python notebooks/dataset_man.py --mode B --force                # ignore cache
 """
 
 import argparse
