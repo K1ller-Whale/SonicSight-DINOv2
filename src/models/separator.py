@@ -98,6 +98,26 @@ class SeparatorModule(pl.LightningModule):
         # additive form). Tunable via cfg.model.fusion_gate_init.
         fusion_gate_init = float(cfg.get("model", {}).get("fusion_gate_init", 0.1))
         self.fusion_gate = nn.Parameter(torch.full((1,), fusion_gate_init))
+
+        # --- Cross-modal consistency loss + forced-vision probe (vision-use fix) ---
+        loss_cfg = cfg.get("train", {}).get("loss", {})
+        # Margin-ranking penalty (dB) requiring each target to be reconstructed
+        # better with its MATCHED visual than with a mismatched one. An
+        # audio-only / content-independent solution scores matched == mismatched
+        # and pays the full margin, so the only way to cut this term is to
+        # actually USE the video content to route sources. Off by default
+        # (weight 0.0); enable via train.loss.consistency_weight.
+        self.consistency_weight = float(loss_cfg.get("consistency_weight", 0.0))
+        self.consistency_margin = float(loss_cfg.get("consistency_margin", 2.0))
+        # Diagnostic probe: replace the per-source frozen Phase-1 masks with a
+        # single source-agnostic base so the per-source VISUAL features are the
+        # ONLY signal that can differentiate the outputs. If val still beats the
+        # mixture-copy floor, vision CAN separate (earlier failure was an
+        # optimization shortcut); if not, the features are uninformative and you
+        # need motion/temporal features. Enable via model.force_symmetric_base.
+        self.force_symmetric_base = bool(
+            cfg.get("model", {}).get("force_symmetric_base", False)
+        )
         self.dinov2_batch_size = int(
             cfg.get("train", {}).get(
                 "dinov2_batch_size",
@@ -409,7 +429,18 @@ class SeparatorModule(pl.LightningModule):
             attended = rearrange(attended, "(B P) 1 D -> B P D", B=B)  # [B, 171, 512]
 
             bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
-            base_n = bottleneck * masks[:, n]  # Phase-1 masked-bottleneck base
+            if self.force_symmetric_base:
+                # PROBE: source-agnostic base so the per-source visual
+                # modulation is the ONLY thing that can differentiate outputs.
+                # Scale by 1/n_sources to stay in the masked-bottleneck
+                # MAGNITUDE the FROZEN decoder expects: the softmax masks sum to
+                # 1 over sources, so their per-element mean is exactly 1/N.
+                # Feeding the raw unmasked bottleneck is ~N x too large -> OOD
+                # for the frozen decoder, which pins val at the mixture floor
+                # regardless of whether vision is informative.
+                base_n = bottleneck / self.n_sources
+            else:
+                base_n = bottleneck * masks[:, n]  # Phase-1 masked-bottleneck base
             # Visual fusion as a BOUNDED MULTIPLICATIVE modulation of the masked
             # bottleneck. The Phase-2 decoder is FROZEN, so it can only interpret
             # masked-bottleneck-distributed input. Additive injection of the raw
@@ -541,6 +572,25 @@ class SeparatorModule(pl.LightningModule):
                 .get("attention_entropy_weight", 0.1)
             )
             total_loss = si_snr_loss + entropy_weight * entropy_loss
+            if self.consistency_weight > 0:
+                consistency_loss = self._cross_modal_consistency_loss(
+                    mixture_stft,
+                    target_waveforms,
+                    si_snr_loss,
+                    visual_features=visual_features,
+                    video_frames=video_frames,
+                )
+                total_loss = (
+                    total_loss + self.consistency_weight * consistency_loss
+                )
+                self.log(
+                    "train/consistency_loss",
+                    consistency_loss,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                    batch_size=B,
+                )
             self.log(
                 "train/si_snr_loss",
                 si_snr_loss,
@@ -622,6 +672,25 @@ class SeparatorModule(pl.LightningModule):
                 + beta * stft_loss
                 + gamma * perceptual_loss
             )
+            if self.consistency_weight > 0:
+                consistency_loss = self._cross_modal_consistency_loss(
+                    mixture_stft,
+                    target_waveforms,
+                    si_snr_loss,
+                    visual_features=visual_features,
+                    video_frames=video_frames,
+                )
+                total_loss = (
+                    total_loss + self.consistency_weight * consistency_loss
+                )
+                self.log(
+                    "train/consistency_loss",
+                    consistency_loss,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=B,
+                )
             self.log(
                 "train/si_snr_loss",
                 si_snr_loss,
@@ -752,6 +821,46 @@ class SeparatorModule(pl.LightningModule):
                 )
             losses.append(sample_loss / N)
         return torch.stack(losses).mean()
+
+    def _cross_modal_consistency_loss(
+        self,
+        mixture_stft: torch.Tensor,
+        target_waveforms: torch.Tensor,
+        matched_si_snr_loss: torch.Tensor,
+        visual_features: Optional[torch.Tensor] = None,
+        video_frames: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Margin-ranking penalty forcing outputs to depend on visual CONTENT.
+
+        Re-runs the separator with the per-source visuals shuffled (mismatched)
+        and requires the MATCHED visuals to reconstruct the fixed-order targets
+        better than the mismatched ones by `consistency_margin` dB:
+
+            relu(margin - (sisnr_db_matched - sisnr_db_mismatched))
+
+        A model that ignores vision scores matched == mismatched and pays the
+        full margin; the only way to minimize the term is to use the video
+        content to route each source. `matched_si_snr_loss` is the fixed-order
+        SI-SNR loss already computed for the matched pass (dB = -loss).
+        """
+        if visual_features is None:
+            if video_frames is None:
+                return mixture_stft.new_zeros(())
+            visual_features = self._video_frames_to_visual_features(video_frames)
+        if visual_features.dim() == 4:
+            visual_features = visual_features.unsqueeze(1).expand(
+                -1, self.n_sources, -1, -1, -1
+            )
+        # roll-by-1 along the source dim guarantees no source keeps its own
+        # visual (a valid mismatch for any n_sources >= 2).
+        mismatched_visual = torch.roll(visual_features, shifts=1, dims=1)
+        mismatched_preds = self(mixture_stft, visual_features=mismatched_visual)
+        mismatched_si_snr_loss = self._fixed_order_si_snr(
+            mismatched_preds, target_waveforms
+        )
+        matched_db = -matched_si_snr_loss
+        mismatched_db = -mismatched_si_snr_loss
+        return torch.relu(self.consistency_margin - (matched_db - mismatched_db))
 
     def _compute_attention_entropy(self) -> torch.Tensor:
         """Mean entropy of cached cross-attention weights (sparsity regularizer)."""

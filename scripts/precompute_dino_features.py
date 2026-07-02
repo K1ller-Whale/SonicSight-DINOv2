@@ -76,6 +76,29 @@ def normalize_frames(frames: torch.Tensor) -> torch.Tensor:
     return frames
 
 
+def spatial_pool_tokens(tokens: torch.Tensor, grid: int) -> torch.Tensor:
+    """Adaptive-average-pool per-frame patch tokens to a coarser grid x grid map.
+
+    tokens: [V, P, D] with P a perfect square (1024 = 32x32 DINOv2 patches).
+    grid <= 0 or grid >= side is a no-op (so re-pooling an already-pooled cache
+    is safe). Pooling trades fine spatial detail -- redundant here, since each
+    source is a single instrument filling the frame -- for the disk budget
+    needed to cache MANY more frames, i.e. higher TEMPORAL resolution for
+    motion. e.g. 32x32=1024 -> 16x16=256 tokens is a 4x per-frame storage cut,
+    which lets the full 19-frame (model-ceiling) cache fit in ~67 GB.
+    """
+    if grid is None or grid <= 0:
+        return tokens
+    V, P, D = tokens.shape
+    side = int(round(P**0.5))
+    if side * side != P or grid >= side:
+        return tokens
+    x = tokens.reshape(V, side, side, D).permute(0, 3, 1, 2)  # [V, D, side, side]
+    x = torch.nn.functional.adaptive_avg_pool2d(x, (grid, grid))  # [V, D, g, g]
+    x = x.permute(0, 2, 3, 1).reshape(V, grid * grid, D)  # [V, g*g, D]
+    return x
+
+
 @torch.no_grad()
 def encode_clip(
     mp4_path: str,
@@ -84,8 +107,13 @@ def encode_clip(
     keep_all: bool,
     num_frames: int,
     batch_size: int,
+    spatial_pool: int = 0,
 ) -> torch.Tensor:
-    """Decode an mp4 visual clip and return DINOv2 tokens [V, 1024, 768] (fp16)."""
+    """Decode an mp4 visual clip and return DINOv2 tokens [V, P, 768] (fp16).
+
+    P = 1024 (32x32 patches) unless spatial_pool > 0, in which case tokens are
+    adaptive-avg-pooled to spatial_pool x spatial_pool.
+    """
     frames = MixAndSepareDataset._load_frames_from_mp4(
         mp4_path
     )  # [150, 3, 448, 448] uint8
@@ -98,6 +126,7 @@ def encode_clip(
         chunk = frames[start : start + max(1, batch_size)]
         feats.append(model(chunk).cpu())
     tokens = torch.cat(feats, dim=0)  # [V, 1024, 768]
+    tokens = spatial_pool_tokens(tokens, spatial_pool)  # [V, P, 768] (pooled if set)
     return tokens.to(torch.float16)
 
 
@@ -142,6 +171,16 @@ def main() -> None:
         "--all-frames",
         action="store_true",
         help="Cache every decoded frame (~150) instead of --num-frames.",
+    )
+    parser.add_argument(
+        "--spatial-pool",
+        type=int,
+        default=0,
+        help="If > 0, adaptive-avg-pool each frame's 32x32=1024 patch tokens to "
+        "this grid side (e.g. 16 -> 16x16=256 tokens, a 4x per-frame storage "
+        "cut). 0 (default) keeps all 1024 tokens. Use with a larger "
+        "--num-frames to trade spatial detail for TEMPORAL resolution (motion) "
+        "within a disk budget; the model handles any token count unchanged.",
     )
     parser.add_argument(
         "--overwrite",
@@ -204,13 +243,18 @@ def main() -> None:
                 keep_all=args.all_frames,
                 num_frames=args.num_frames,
                 batch_size=args.dinov2_batch_size,
+                spatial_pool=args.spatial_pool,
             )
         else:
             # Already a precomputed .pt tensor; load and (optionally) trim/recast.
+            # NOTE: this branch can only TRIM/pool an existing cache -- it cannot
+            # add frames. To (re)build a denser cache the index must point at the
+            # source mp4s, not a smaller .pt cache.
             tokens = torch.load(src_path, weights_only=False)
             if not args.all_frames and tokens.shape[0] > args.num_frames:
                 idx = select_frame_indices(tokens.shape[0], args.num_frames)
                 tokens = tokens[idx]
+            tokens = spatial_pool_tokens(tokens.float(), args.spatial_pool)
             tokens = tokens.to(torch.float16)
 
         torch.save(tokens, out_path)
