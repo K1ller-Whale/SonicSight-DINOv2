@@ -43,6 +43,9 @@ train:
 
 model:
   n_sources: 2
+  force_symmetric_base: true     # required: turns the probe on
+  matched_base_probe: true       # NEW: in-distribution detached-mask base
+  fusion_gate_init: 0.1          # vision ON (run 1)
 
 data:
   index_file: "./cache/index.json"
