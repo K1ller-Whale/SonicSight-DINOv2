@@ -118,6 +118,36 @@ class SeparatorModule(pl.LightningModule):
         self.force_symmetric_base = bool(
             cfg.get("model", {}).get("force_symmetric_base", False)
         )
+
+        # --- Motion features (Step B): explicit frame-to-frame token deltas +
+        # temporal-window attention. OFF by default (use_motion_features=False)
+        # so existing behavior/checkpoints are unaffected. Probe A showed that
+        # a SINGLE static frame per audio column -- even at the model's full
+        # 19-frame temporal ceiling -- carries no generalizable same-category
+        # separation signal (val got WORSE as fusion_gate grew). This adds an
+        # explicit motion signal (raw_n[t] - raw_n[t-1], projected separately)
+        # and lets each of the 171 audio positions attend over a small
+        # TEMPORAL WINDOW of frames (not just its single aligned frame), with a
+        # learned per-offset embedding so attention can tell past/current/
+        # future apart. Computed on the fly from the existing cache -- no
+        # re-precompute needed. Enable via model.use_motion_features (+
+        # model.temporal_window, odd int >= 1, default 1 = motion at the
+        # aligned frame only, no neighboring frames).
+        motion_cfg = cfg.get("model", {})
+        self.use_motion_features = bool(motion_cfg.get("use_motion_features", False))
+        self.temporal_window = int(motion_cfg.get("temporal_window", 1))
+        if self.temporal_window < 1 or self.temporal_window % 2 == 0:
+            raise ValueError("model.temporal_window must be a positive odd integer")
+        self.motion_proj = nn.Linear(768, 512, bias=False)
+        # Same ReZero-with-warm-start reasoning as fusion_gate: at gate==0 the
+        # motion pathway gets no gradient signal and never grows.
+        motion_gate_init = float(motion_cfg.get("motion_gate_init", 0.1))
+        self.motion_gate = nn.Parameter(torch.full((1,), motion_gate_init))
+        self.temporal_pos_enc = nn.Parameter(
+            torch.randn(self.temporal_window, 512) * 0.02
+        )
+        self._window_idx_cache: Dict[Any, torch.Tensor] = {}
+
         self.dinov2_batch_size = int(
             cfg.get("train", {}).get(
                 "dinov2_batch_size",
@@ -166,6 +196,9 @@ class SeparatorModule(pl.LightningModule):
             self._set_trainable(self.cross_attn, False)
             self.source_queries.requires_grad_(False)
             self.fusion_gate.requires_grad_(False)
+            self._set_trainable(self.motion_proj, False)
+            self.motion_gate.requires_grad_(False)
+            self.temporal_pos_enc.requires_grad_(False)
         elif self.phase == "phase2":
             self._set_trainable(self.audio_unet, False)
             self._set_trainable(self.joint_mask_head, False)
@@ -174,6 +207,9 @@ class SeparatorModule(pl.LightningModule):
             self._set_trainable(self.cross_attn, True)
             self.source_queries.requires_grad_(True)
             self.fusion_gate.requires_grad_(True)
+            self._set_trainable(self.motion_proj, True)
+            self.motion_gate.requires_grad_(True)
+            self.temporal_pos_enc.requires_grad_(True)
         else:
             self._set_trainable(self.audio_unet, False)
             self._set_trainable(self.joint_mask_head, False)
@@ -185,6 +221,9 @@ class SeparatorModule(pl.LightningModule):
             self._set_trainable(self.cross_attn, True)
             self.source_queries.requires_grad_(True)
             self.fusion_gate.requires_grad_(True)
+            self._set_trainable(self.motion_proj, True)
+            self.motion_gate.requires_grad_(True)
+            self.temporal_pos_enc.requires_grad_(True)
 
     def _apply_dinov2_freeze(self, cfg: Dict[str, Any]):
         """Apply DINOv2 freezing based on config (phase3 may unfreeze top blocks)."""
@@ -350,6 +389,26 @@ class SeparatorModule(pl.LightningModule):
         self._frame_idx_cache[num_frames] = idx
         return idx
 
+    def _temporal_window_idx(
+        self, frame_idx: torch.Tensor, num_frames: int, window: int, device
+    ) -> torch.Tensor:
+        """For each of the 171 aligned positions, return `window` frame
+        indices centered on its single aligned frame (from
+        _frame_alignment_idx), clamped to [0, num_frames-1].
+
+        window=1 reduces to frame_idx.unsqueeze(-1) (motion at the aligned
+        frame only, no neighboring frames). Cached per (num_frames, window).
+        """
+        cache_key = (num_frames, window)
+        cached = self._window_idx_cache.get(cache_key)
+        if cached is not None:
+            return cached.to(device)
+        half = window // 2
+        offsets = torch.arange(-half, half + 1, device=frame_idx.device)
+        idx = (frame_idx.unsqueeze(-1) + offsets.unsqueeze(0)).clamp(0, num_frames - 1)
+        self._window_idx_cache[cache_key] = idx
+        return idx.to(device)
+
     def forward(
         self,
         mixture_stft: torch.Tensor,
@@ -407,16 +466,36 @@ class SeparatorModule(pl.LightningModule):
                 self._cached_attn_weights.append(output[1].detach())
 
         for n in range(self.n_sources):
-            vkv_n = self.visual_proj(visual_features[:, n])  # [B, V, 1024, 512]
+            vkv_n = self.visual_proj(visual_features[:, n])  # [B, V, P, 512]
             # Align each of the 171 bottleneck positions to a cached video frame.
             # Computed dynamically so it works for the full 150-frame features
             # and the compact 19-frame cache (no index overflow either way).
             frame_idx = self._frame_alignment_idx(vkv_n.shape[1], vkv_n.device)
-            vkv_n_aligned = vkv_n[:, frame_idx]  # [B, 171, 1024, 512]
+
+            if self.use_motion_features:
+                # STEP B: explicit motion (frame-to-frame token deltas) +
+                # temporal-window attention -- see __init__ comment for why.
+                raw_n = visual_features[:, n]  # [B, V, P, 768]
+                delta_n = raw_n - torch.cat([raw_n[:, :1], raw_n[:, :-1]], dim=1)
+                vkv_motion_n = self.motion_proj(delta_n)  # [B, V, P, 512]
+                window_idx = self._temporal_window_idx(
+                    frame_idx, vkv_n.shape[1], self.temporal_window, vkv_n.device
+                )  # [171, W]
+                app_window = vkv_n[:, window_idx]  # [B, 171, W, P, 512]
+                mot_window = vkv_motion_n[:, window_idx]  # [B, 171, W, P, 512]
+                # Learned per-offset embedding so attention can tell WHICH
+                # frame in the window a token came from.
+                temporal_pe = self.temporal_pos_enc.view(
+                    1, 1, self.temporal_window, 1, 512
+                )
+                combined = (app_window + temporal_pe) + self.motion_gate * mot_window
+                kv = rearrange(combined, "B Pos W K D -> (B Pos) (W K) D")
+            else:
+                vkv_n_aligned = vkv_n[:, frame_idx]  # [B, 171, P, 512]
+                kv = rearrange(vkv_n_aligned, "B P K D -> (B P) K D")
 
             # Per-source, per-position local attention
             q = rearrange(bottleneck_flat, "B P D -> (B P) 1 D")
-            kv = rearrange(vkv_n_aligned, "B P K D -> (B P) K D")
             # need_weights=True so attention can be inspected for localisation.
             attended_tuple = self.cross_attn(
                 q, kv, need_weights=True, average_attn_weights=False
@@ -580,9 +659,7 @@ class SeparatorModule(pl.LightningModule):
                     visual_features=visual_features,
                     video_frames=video_frames,
                 )
-                total_loss = (
-                    total_loss + self.consistency_weight * consistency_loss
-                )
+                total_loss = total_loss + self.consistency_weight * consistency_loss
                 self.log(
                     "train/consistency_loss",
                     consistency_loss,
@@ -680,9 +757,7 @@ class SeparatorModule(pl.LightningModule):
                     visual_features=visual_features,
                     video_frames=video_frames,
                 )
-                total_loss = (
-                    total_loss + self.consistency_weight * consistency_loss
-                )
+                total_loss = total_loss + self.consistency_weight * consistency_loss
                 self.log(
                     "train/consistency_loss",
                     consistency_loss,
