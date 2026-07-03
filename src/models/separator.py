@@ -119,6 +119,20 @@ class SeparatorModule(pl.LightningModule):
             cfg.get("model", {}).get("force_symmetric_base", False)
         )
 
+        # Matched-base probe variant (Bug 3 control): the symmetric base above
+        # scales every element by a FLAT 1/N, spatially unlike the real masked
+        # bottleneck the frozen decoder was trained on, so it may itself pin val
+        # at the floor. When BOTH force_symmetric_base and matched_base_probe are
+        # on, the base becomes the real, DETACHED Phase-1 per-source masks (in-
+        # distribution for the decoder). The detached masks already route the
+        # sources, so to isolate VISION run this twice -- once as configured and
+        # once with model.fusion_gate_init=0.0 -- and compare val SI-SNR
+        # (ON minus OFF = vision contribution). Off by default. Enable via
+        # model.matched_base_probe.
+        self.matched_base_probe = bool(
+            cfg.get("model", {}).get("matched_base_probe", False)
+        )
+
         # --- Motion features (Step B): explicit frame-to-frame token deltas +
         # temporal-window attention. OFF by default (use_motion_features=False)
         # so existing behavior/checkpoints are unaffected. Probe A showed that
@@ -509,15 +523,18 @@ class SeparatorModule(pl.LightningModule):
 
             bottleneck_out_n = rearrange(attended, "B (H W) D -> B D H W", H=9, W=19)
             if self.force_symmetric_base:
-                # PROBE: source-agnostic base so the per-source visual
-                # modulation is the ONLY thing that can differentiate outputs.
-                # Scale by 1/n_sources to stay in the masked-bottleneck
-                # MAGNITUDE the FROZEN decoder expects: the softmax masks sum to
-                # 1 over sources, so their per-element mean is exactly 1/N.
-                # Feeding the raw unmasked bottleneck is ~N x too large -> OOD
-                # for the frozen decoder, which pins val at the mixture floor
-                # regardless of whether vision is informative.
-                base_n = bottleneck / self.n_sources
+                if self.matched_base_probe:
+                    # CONTROL (matched base): in-distribution base = real Phase-1
+                    # masks, DETACHED so no gradient flows through audio routing.
+                    # Run with fusion_gate_init=0.0 (vision off) vs default
+                    # (vision on) and compare val SI-SNR to isolate vision.
+                    base_n = bottleneck * masks[:, n].detach()
+                else:
+                    # PROBE: source-agnostic flat base (1/N) so per-source visual
+                    # modulation is the ONLY differentiator. Scaled by 1/N to
+                    # match the masked-bottleneck MAGNITUDE the frozen decoder
+                    # expects (softmax masks sum to 1 over sources; mean = 1/N).
+                    base_n = bottleneck / self.n_sources
             else:
                 base_n = bottleneck * masks[:, n]  # Phase-1 masked-bottleneck base
             # Visual fusion as a BOUNDED MULTIPLICATIVE modulation of the masked
